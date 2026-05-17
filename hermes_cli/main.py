@@ -11454,7 +11454,10 @@ Examples:
         "--args", nargs="*", default=[], help="Arguments for stdio command"
     )
     mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
-    mcp_add_p.add_argument("--preset", help="Known MCP preset name")
+    mcp_add_p.add_argument(
+        "--preset",
+        help="Known MCP preset name (e.g. local-cdp)",
+    )
     mcp_add_p.add_argument(
         "--env",
         nargs="*",
@@ -11469,6 +11472,15 @@ Examples:
 
     mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
     mcp_test_p.add_argument("name", help="Server name to test")
+
+    mcp_smoke_p = mcp_sub.add_parser("smoke", help="Call one MCP tool as a runtime smoke test")
+    mcp_smoke_p.add_argument("name", help="Server name to smoke test")
+    mcp_smoke_p.add_argument("--tool", help="Tool name to call (defaults to list_pages for chrome-devtools)")
+    mcp_smoke_p.add_argument(
+        "--arguments",
+        default="{}",
+        help="JSON object of tool arguments (default: {})",
+    )
 
     mcp_cfg_p = mcp_sub.add_parser(
         "configure", aliases=["config"], help="Toggle tool selection"

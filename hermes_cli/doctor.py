@@ -105,6 +105,62 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
+def _cdp_discovery_url(raw_url: str) -> str:
+    """Return the HTTP /json/version URL for a discovery-style CDP endpoint."""
+    from urllib.parse import urlparse, urlunparse
+
+    raw = (raw_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    if parsed.scheme in {"ws", "wss"} and parsed.path.startswith("/devtools/browser/"):
+        return ""
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    path = parsed.path or ""
+    if path.rstrip("/") in {"", "/json", "/json/version"}:
+        path = "/json/version"
+    else:
+        path = path.rstrip("/") + "/json/version"
+    return urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
+
+def _probe_cdp_version(raw_url: str, timeout: float = 2.0) -> tuple[bool, str]:
+    """Probe a local CDP discovery endpoint without raising into doctor."""
+    import json
+    import urllib.request
+
+    version_url = _cdp_discovery_url(raw_url)
+    if not version_url:
+        return False, "concrete WebSocket endpoint; skip HTTP discovery probe"
+    try:
+        with urllib.request.urlopen(version_url, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return False, f"{version_url} unreachable: {exc}"
+
+    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
+    browser = str(payload.get("Browser") or "Chrome").strip()
+    protocol = str(payload.get("Protocol-Version") or "").strip()
+    if not ws_url:
+        return False, f"{version_url} did not return webSocketDebuggerUrl"
+    detail = f"{browser}"
+    if protocol:
+        detail += f", protocol {protocol}"
+    return True, detail
+
+
+def _mcp_server_uses_chrome_devtools(server_cfg: dict) -> bool:
+    command = str(server_cfg.get("command") or "")
+    args = server_cfg.get("args") or []
+    joined = " ".join(str(a) for a in [command, *args])
+    return "chrome-devtools-mcp" in joined
+
+
+def _has_arg_prefix(server_cfg: dict, prefixes: tuple[str, ...]) -> bool:
+    args = [str(a) for a in (server_cfg.get("args") or [])]
+    return any(any(a == p or a.startswith(p + "=") for p in prefixes) for a in args)
+
+
 def _honcho_is_configured_for_doctor() -> bool:
     """Return True when Honcho is configured, even if this process has no active session."""
     try:
@@ -746,6 +802,79 @@ def run_doctor(args):
                     issues.append("Stale root-level provider/base_url in config.yaml — run 'hermes doctor --fix'")
         except Exception:
             pass
+
+        # Validate browser CDP and Chrome DevTools MCP surfaces when configured.
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                raw_config = yaml.safe_load(f) or {}
+
+            browser_cfg = raw_config.get("browser") if isinstance(raw_config, dict) else {}
+            browser_cfg = browser_cfg if isinstance(browser_cfg, dict) else {}
+            cdp_url = str(browser_cfg.get("cdp_url") or "").strip()
+
+            mcp_servers = raw_config.get("mcp_servers") if isinstance(raw_config, dict) else {}
+            mcp_servers = mcp_servers if isinstance(mcp_servers, dict) else {}
+            chrome_mcp = [
+                (name, cfg)
+                for name, cfg in mcp_servers.items()
+                if isinstance(cfg, dict)
+                and cfg.get("enabled", True) is not False
+                and (
+                    str(name) == "chrome-devtools"
+                    or _mcp_server_uses_chrome_devtools(cfg)
+                )
+            ]
+
+            if cdp_url or chrome_mcp:
+                print()
+                print(color("◆ Browser CDP / Chrome DevTools MCP", Colors.CYAN, Colors.BOLD))
+
+            if cdp_url:
+                ok, detail = _probe_cdp_version(cdp_url)
+                if ok:
+                    check_ok(f"browser.cdp_url reachable ({cdp_url})", f"({detail})")
+                else:
+                    check_warn(f"browser.cdp_url not reachable ({cdp_url})", f"({detail})")
+                    issues.append(
+                        "browser.cdp_url is configured but not reachable; start Chrome with remote debugging or update browser.cdp_url"
+                    )
+
+            for name, srv in chrome_mcp:
+                check_ok(f"MCP server '{name}' uses chrome-devtools-mcp")
+                print(
+                    color(
+                        f"  Runtime smoke: hermes mcp smoke {name}",
+                        Colors.DIM,
+                    )
+                )
+                if not _has_arg_prefix(srv, ("--browserUrl", "--browser-url", "--wsEndpoint", "--ws-endpoint", "--autoConnect", "--auto-connect")):
+                    check_warn(
+                        f"MCP server '{name}' has no explicit Chrome attach mode",
+                        "(add --browserUrl, --wsEndpoint, or --autoConnect)",
+                    )
+                    issues.append(
+                        f"MCP server '{name}' uses chrome-devtools-mcp without an explicit Chrome attach mode"
+                    )
+                if not _has_arg_prefix(srv, ("--redactNetworkHeaders", "--redact-network-headers")):
+                    check_warn(
+                        f"MCP server '{name}' does not redact network headers",
+                        "(add --redactNetworkHeaders for safer agent output)",
+                    )
+                if not _has_arg_prefix(srv, ("--no-usage-statistics",)):
+                    env_cfg = srv.get("env") if isinstance(srv.get("env"), dict) else {}
+                    if not env_cfg.get("CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"):
+                        check_warn(
+                            f"MCP server '{name}' has usage statistics enabled",
+                            "(add --no-usage-statistics or CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS)",
+                        )
+                if _has_arg_prefix(srv, ("--categoryExtensions", "--category-extensions")) and _has_arg_prefix(srv, ("--browserUrl", "--browser-url", "--wsEndpoint", "--ws-endpoint", "--autoConnect", "--auto-connect")):
+                    check_warn(
+                        f"MCP server '{name}' enables extension tools with attach mode",
+                        "(official support requires pipe/direct launch until Chrome 149)",
+                    )
+        except Exception as e:
+            check_warn("Could not validate browser CDP / Chrome DevTools MCP config", f"({e})")
 
         # Validate config structure (catches malformed custom_providers, etc.)
         try:

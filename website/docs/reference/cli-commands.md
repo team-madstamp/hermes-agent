@@ -944,10 +944,11 @@ Manage MCP (Model Context Protocol) server configurations and run Hermes as an M
 | Subcommand | Description |
 |------------|-------------|
 | `serve [-v\|--verbose]` | Run Hermes as an MCP server — expose conversations to other agents. |
-| `add <name> [--url URL] [--command CMD] [--args ...] [--auth oauth\|header]` | Add an MCP server with automatic tool discovery. |
+| `add <name> [--url URL] [--command CMD] [--args ...] [--auth oauth\|header] [--preset PRESET]` | Add an MCP server with automatic tool discovery. Use `--preset local-cdp` for the standard local Chrome DevTools MCP setup on `127.0.0.1:9222`. |
 | `remove <name>` (alias: `rm`) | Remove an MCP server from config. |
 | `list` (alias: `ls`) | List configured MCP servers. |
 | `test <name>` | Test connection to an MCP server. |
+| `smoke <name> [--tool TOOL] [--arguments JSON]` | Call one MCP tool as a runtime smoke test. Defaults to `list_pages` for Chrome DevTools MCP and redacts URL query strings in printed output. |
 | `configure <name>` (alias: `config`) | Toggle tool selection for a server. |
 | `login <name>` | Force re-authentication for an OAuth-based MCP server. |
 

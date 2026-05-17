@@ -3977,11 +3977,11 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         == "Chrome isn't running with remote debugging — attempting to launch..."
     )
     assert any(
-        "No Chrome/Chromium executable was found" in line
-        for line in resp["result"]["messages"]
+        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
     )
     assert any(
-        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
+        "--remote-debugging-address=127.0.0.1" in line
+        for line in resp["result"]["messages"]
     )
     assert "BROWSER_CDP_URL" not in os.environ
     progress = [p["message"] for evt, p in emitted if evt == "browser.progress"]
