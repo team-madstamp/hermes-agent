@@ -9,13 +9,11 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
 
 from hermes_cli.config import (
     cfg_get,
@@ -38,21 +36,6 @@ _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
     "codex": {
         "command": "codex",
         "args": ["mcp-server"],
-    },
-    "local-cdp": {
-        "command": "npx",
-        "args": [
-            "-y",
-            "chrome-devtools-mcp@latest",
-            "--browserUrl=http://127.0.0.1:9222",
-            "--no-usage-statistics",
-            "--no-performance-crux",
-            "--redactNetworkHeaders",
-        ],
-        "env": {
-            "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1",
-            "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
-        },
     },
 }
 
@@ -126,6 +109,21 @@ def _env_key_for_server(name: str) -> str:
     return f"MCP_{name.upper().replace('-', '_')}_API_KEY"
 
 
+def _strip_bearer_prefix(token: str) -> str:
+    """Strip a leading ``Bearer `` from a pasted token.
+
+    The header template stores ``Authorization: Bearer ${MCP_X_API_KEY}``, so
+    if a user pastes a token that already includes the ``Bearer `` prefix the
+    server receives ``Bearer Bearer <jwt>`` → 401. Normalize on save. (#37792)
+    """
+    if not isinstance(token, str):
+        return token
+    stripped = token.strip()
+    if stripped[:7].lower() == "bearer ":
+        return stripped[7:].strip()
+    return stripped
+
+
 def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
     """Parse ``KEY=VALUE`` strings from CLI args into an env dict."""
     parsed: Dict[str, str] = {}
@@ -175,14 +173,32 @@ def _apply_mcp_preset(
         server_config["command"] = command
     if cmd_args:
         server_config["args"] = cmd_args
-    preset_env = preset.get("env")
-    if isinstance(preset_env, dict) and preset_env:
-        server_config["env"] = dict(preset_env)
 
     return url, command, cmd_args, True
 
 
 # ─── Discovery (temporary connect) ───────────────────────────────────────────
+
+def _resolve_mcp_server_config(config: dict) -> dict:
+    """Resolve ``${ENV}`` placeholders in a server config before connecting.
+
+    Mirrors ``_load_mcp_config()`` in ``tools/mcp_tool.py``: load
+    ``~/.hermes/.env`` into ``os.environ`` and recursively interpolate any
+    ``${VAR}`` placeholders. The CLI builds header templates like
+    ``Authorization: Bearer ${MCP_X_API_KEY}`` but the probe path never
+    resolved them, so the discovery probe sent the literal placeholder and
+    auth-requiring servers (e.g. n8n) returned 401 — while runtime tool
+    loading worked because it interpolates. (#37792)
+    """
+    from tools.mcp_tool import _interpolate_env_vars
+
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv()
+    except Exception:  # pragma: no cover — defensive
+        pass
+    return _interpolate_env_vars(config)
+
 
 def _probe_single_server(
     name: str, config: dict, connect_timeout: float = 30
@@ -199,6 +215,8 @@ def _probe_single_server(
         _stop_mcp_loop,
     )
 
+    config = _resolve_mcp_server_config(config)
+
     _ensure_mcp_loop()
 
     tools_found: List[Tuple[str, str]] = []
@@ -207,13 +225,15 @@ def _probe_single_server(
         server = await asyncio.wait_for(
             _connect_server(name, config), timeout=connect_timeout
         )
-        for t in server._tools:
-            desc = getattr(t, "description", "") or ""
-            # Truncate long descriptions for display
-            if len(desc) > 80:
-                desc = desc[:77] + "..."
-            tools_found.append((t.name, desc))
-        await server.shutdown()
+        try:
+            for t in server._tools:
+                desc = getattr(t, "description", "") or ""
+                # Truncate long descriptions for display
+                if len(desc) > 80:
+                    desc = desc[:77] + "..."
+                tools_found.append((t.name, desc))
+        finally:
+            await server.shutdown()
 
     try:
         _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
@@ -225,48 +245,20 @@ def _probe_single_server(
     return tools_found
 
 
-def _call_single_server_tool(
-    name: str,
-    config: dict,
-    tool_name: str,
-    arguments: Optional[dict] = None,
-    connect_timeout: float = 30,
-) -> Any:
-    """Temporarily connect to one MCP server, call one tool, disconnect."""
-    from tools.mcp_tool import (
-        _ensure_mcp_loop,
-        _run_on_mcp_loop,
-        _connect_server,
-        _stop_mcp_loop,
-    )
+def _oauth_tokens_present(name: str) -> bool:
+    """Return True if an OAuth token file exists on disk for ``name``.
 
-    _ensure_mcp_loop()
-    tool_timeout = float(config.get("timeout", 120))
-
-    async def _call():
-        server = await asyncio.wait_for(
-            _connect_server(name, config), timeout=connect_timeout
-        )
-        try:
-            available = {getattr(t, "name", "") for t in server._tools}
-            if tool_name not in available:
-                raise ValueError(
-                    f"Tool '{tool_name}' not found on server '{name}'. "
-                    f"Available: {', '.join(sorted(t for t in available if t))}"
-                )
-            return await asyncio.wait_for(
-                server.session.call_tool(tool_name, arguments=arguments or {}),
-                timeout=tool_timeout,
-            )
-        finally:
-            await server.shutdown()
-
+    Used after ``hermes mcp login`` to distinguish a genuine authentication
+    from a probe that succeeded only because the server allowed
+    initialize/tools-list without auth (so no token was ever acquired).
+    """
     try:
-        return _run_on_mcp_loop(_call(), timeout=connect_timeout + tool_timeout + 10)
-    except BaseException as exc:
-        raise _unwrap_exception_group(exc) from None
-    finally:
-        _stop_mcp_loop()
+        from tools.mcp_oauth import HermesTokenStorage
+        return HermesTokenStorage(name).has_cached_tokens()
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
+        # Be permissive on unexpected errors: don't block a real success.
+        return True
 
 
 def _unwrap_exception_group(exc: BaseException) -> Exception:
@@ -296,6 +288,8 @@ def cmd_mcp_add(args):
     # hermes_cli/main.py for why the dest is renamed.
     command = getattr(args, "mcp_command", None)
     cmd_args = getattr(args, "args", None) or []
+    if cmd_args and cmd_args[0] == "--":
+        cmd_args = cmd_args[1:]
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
@@ -343,11 +337,7 @@ def cmd_mcp_add(args):
         if cmd_args:
             server_config["args"] = cmd_args
         if explicit_env:
-            preset_env = server_config.get("env")
-            if isinstance(preset_env, dict):
-                server_config["env"] = {**preset_env, **explicit_env}
-            else:
-                server_config["env"] = explicit_env
+            server_config["env"] = explicit_env
 
 
     # ── Authentication ────────────────────────────────────────────────
@@ -392,6 +382,7 @@ def cmd_mcp_add(args):
                 else:
                     api_key = _prompt("API key / Bearer token", password=True)
                     if api_key:
+                        api_key = _strip_bearer_prefix(api_key)
                         save_env_value(env_key, api_key)
                         _success(f"Saved to {display_hermes_home()}/.env as {env_key}")
 
@@ -650,107 +641,6 @@ def cmd_mcp_test(args):
     print()
 
 
-# ─── hermes mcp smoke ────────────────────────────────────────────────────────
-
-def _default_smoke_tool(name: str, cfg: dict) -> Optional[str]:
-    joined = " ".join(
-        str(a) for a in [cfg.get("command", ""), *(cfg.get("args") or [])]
-    )
-    if name == "chrome-devtools" or "chrome-devtools-mcp" in joined:
-        return "list_pages"
-    return None
-
-
-def _summarize_mcp_result(result: Any) -> str:
-    """Return a compact, non-secret textual summary for a tool result."""
-    try:
-        structured = getattr(result, "structuredContent", None)
-        if structured is not None:
-            return _redact_urls(
-                json.dumps(structured, ensure_ascii=False, default=str)
-            )[:1200]
-        content = getattr(result, "content", None)
-        if content:
-            parts = []
-            for item in content:
-                text = getattr(item, "text", None)
-                if text is not None:
-                    parts.append(str(text))
-                else:
-                    parts.append(str(item))
-            return _redact_urls("\n".join(parts))[:1200]
-    except Exception:
-        pass
-    return _redact_urls(str(result))[:1200]
-
-
-_URL_RE = re.compile(r"https?://[^\s\])>\"']+")
-
-
-def _redact_urls(text: str) -> str:
-    """Mask URL query strings before printing MCP smoke output."""
-
-    def _replace(match: re.Match[str]) -> str:
-        raw_url = match.group(0)
-        try:
-            parts = urlsplit(raw_url)
-        except ValueError:
-            return raw_url
-        if not parts.query:
-            return raw_url
-        return urlunsplit(
-            (parts.scheme, parts.netloc, parts.path, "<redacted-query>", "")
-        )
-
-    return _URL_RE.sub(_replace, text)
-
-
-def cmd_mcp_smoke(args):
-    """Call one safe MCP tool to verify runtime behavior, not just discovery."""
-    name = args.name
-    servers = _get_mcp_servers()
-
-    if name not in servers:
-        _error(f"Server '{name}' not found in config.")
-        available = list(servers.keys())
-        if available:
-            _info(f"Available: {', '.join(available)}")
-        return
-
-    cfg = servers[name]
-    tool_name = getattr(args, "tool", None) or _default_smoke_tool(name, cfg)
-    if not tool_name:
-        _error("No default smoke tool for this server. Pass --tool <name>.")
-        return
-
-    raw_args = getattr(args, "arguments", None) or "{}"
-    try:
-        tool_args = json.loads(raw_args)
-        if not isinstance(tool_args, dict):
-            raise ValueError("arguments must decode to a JSON object")
-    except Exception as exc:
-        _error(f"Invalid --arguments JSON: {exc}")
-        return
-
-    print()
-    print(color(f"  Smoking '{name}' with tool '{tool_name}'...", Colors.CYAN))
-    start = time.monotonic()
-    try:
-        result = _call_single_server_tool(name, cfg, tool_name, tool_args)
-        elapsed_ms = (time.monotonic() - start) * 1000
-    except Exception as exc:
-        elapsed_ms = (time.monotonic() - start) * 1000
-        _error(f"Smoke failed ({elapsed_ms:.0f}ms): {exc}")
-        return
-
-    _success(f"Smoke passed ({elapsed_ms:.0f}ms)")
-    summary = _summarize_mcp_result(result)
-    if summary:
-        print()
-        print(summary)
-    print()
-
-
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
 def cmd_mcp_login(args):
@@ -800,6 +690,36 @@ def cmd_mcp_login(args):
     # Probe triggers the OAuth flow (browser redirect + callback capture).
     try:
         tools = _probe_single_server(name, server_config)
+        # A clean probe is NOT proof of authentication. Some MCP servers
+        # (notably Google's official Drive server) serve initialize +
+        # tools/list WITHOUT auth, so the probe lists tools even when the
+        # OAuth flow never completed — e.g. dynamic client registration
+        # 400'd because the provider doesn't support RFC 7591. Reporting
+        # "Authenticated — N tools" in that case is a false success: every
+        # real tool call later hangs until timeout because there's no token.
+        # Verify a token actually landed on disk before claiming success.
+        if not _oauth_tokens_present(name):
+            _warning(
+                "Server responded, but no OAuth token was obtained — "
+                "authentication did not complete."
+            )
+            print()
+            _info(
+                "Some providers (e.g. Google Drive, Atlassian) do not support "
+                "automatic client registration. For those you must create an "
+                "OAuth client yourself and add its credentials to config.yaml:"
+            )
+            print()
+            print(color(f"    mcp_servers:", Colors.DIM))
+            print(color(f"      {name}:", Colors.DIM))
+            print(color(f"        url: {url}", Colors.DIM))
+            print(color(f"        auth: oauth", Colors.DIM))
+            print(color(f"        oauth:", Colors.DIM))
+            print(color(f"          client_id: \"<your-oauth-client-id>\"", Colors.DIM))
+            print(color(f"          client_secret: \"<your-oauth-client-secret>\"", Colors.DIM))
+            print()
+            _info("Then re-run `hermes mcp login " + name + "`.")
+            return
         if tools:
             _success(f"Authenticated — {len(tools)} tool(s) available")
         else:
@@ -918,6 +838,24 @@ def mcp_command(args):
         run_mcp_server(verbose=getattr(args, "verbose", False))
         return
 
+    # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so
+    # the original `mcp_config` module stays import-cheap.
+    if action == "picker":
+        from hermes_cli.mcp_picker import run_picker
+        run_picker()
+        return
+    if action == "catalog":
+        from hermes_cli.mcp_picker import show_catalog
+        show_catalog()
+        return
+    if action == "install":
+        from hermes_cli.mcp_picker import install_by_name
+        import sys as _sys
+        rc = install_by_name(getattr(args, "identifier", "") or "")
+        if rc:
+            _sys.exit(rc)
+        return
+
     handlers = {
         "add": cmd_mcp_add,
         "remove": cmd_mcp_remove,
@@ -925,7 +863,6 @@ def mcp_command(args):
         "list": cmd_mcp_list,
         "ls": cmd_mcp_list,
         "test": cmd_mcp_test,
-        "smoke": cmd_mcp_smoke,
         "configure": cmd_mcp_configure,
         "config": cmd_mcp_configure,
         "login": cmd_mcp_login,
@@ -935,17 +872,21 @@ def mcp_command(args):
     if handler:
         handler(args)
     else:
-        # No subcommand — show list
-        cmd_mcp_list()
+        # No subcommand — drop the user into the catalog picker. This is the
+        # "try enabling and it flows you into setup" UX matching `hermes plugin`.
+        from hermes_cli.mcp_picker import run_picker
+        run_picker()
         print(color("  Commands:", Colors.CYAN))
+        _info("hermes mcp                                    Open the catalog picker (default)")
+        _info("hermes mcp catalog                            List Nous-approved MCPs")
+        _info("hermes mcp install <name>                     Install a catalog MCP")
         _info("hermes mcp serve                              Run as MCP server")
-        _info("hermes mcp add <name> --url <endpoint>        Add an MCP server")
+        _info("hermes mcp add <name> --url <endpoint>        Add a custom MCP server")
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
         _info("hermes mcp remove <name>                      Remove a server")
-        _info("hermes mcp list                               List servers")
+        _info("hermes mcp list                               List configured servers")
         _info("hermes mcp test <name>                        Test connection")
-        _info("hermes mcp smoke <name>                       Call one safe tool")
         _info("hermes mcp configure <name>                   Toggle tools")
         _info("hermes mcp login <name>                       Re-authenticate OAuth")
         print()

@@ -6,12 +6,7 @@ any actual MCP servers or API keys.
 """
 
 import argparse
-import json
-import os
-import types
 from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -336,13 +331,7 @@ class TestMcpAdd:
         """A preset fills in command/args when no explicit transport given."""
         monkeypatch.setattr(
             "hermes_cli.mcp_config._MCP_PRESETS",
-            {
-                "testmcp": {
-                    "command": "npx",
-                    "args": ["-y", "test-mcp-server"],
-                    "display_name": "Test MCP",
-                }
-            },
+            {"testmcp": {"command": "npx", "args": ["-y", "test-mcp-server"], "display_name": "Test MCP"}},
         )
         fake_tools = [FakeTool("do_thing", "Does a thing")]
 
@@ -375,13 +364,7 @@ class TestMcpAdd:
         """Explicit transports win over presets."""
         monkeypatch.setattr(
             "hermes_cli.mcp_config._MCP_PRESETS",
-            {
-                "testmcp": {
-                    "command": "npx",
-                    "args": ["-y", "test-mcp-server"],
-                    "display_name": "Test MCP",
-                }
-            },
+            {"testmcp": {"command": "npx", "args": ["-y", "test-mcp-server"], "display_name": "Test MCP"}},
         )
         fake_tools = [FakeTool("search", "Search repos")]
 
@@ -413,79 +396,6 @@ class TestMcpAdd:
         assert srv["command"] == "uvx"
         assert srv["args"] == ["custom-server"]
         assert "env" not in srv
-
-    def test_local_cdp_preset_wires_safe_chrome_devtools_defaults(
-        self, tmp_path, capsys, monkeypatch
-    ):
-        fake_tools = [FakeTool("list_pages", "List open pages")]
-
-        def mock_probe(name, config, **kw):
-            assert name == "chrome-devtools"
-            assert config["command"] == "npx"
-            assert "chrome-devtools-mcp@latest" in config["args"]
-            assert "--browserUrl=http://127.0.0.1:9222" in config["args"]
-            assert "--no-usage-statistics" in config["args"]
-            assert "--no-performance-crux" in config["args"]
-            assert "--redactNetworkHeaders" in config["args"]
-            assert config["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"] == "1"
-            assert config["env"]["CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS"] == "1"
-            return [(t.name, t.description) for t in fake_tools]
-
-        monkeypatch.setattr(
-            "hermes_cli.mcp_config._probe_single_server", mock_probe
-        )
-        monkeypatch.setattr("builtins.input", lambda _: "")
-
-        from hermes_cli.mcp_config import cmd_mcp_add
-        from hermes_cli.config import read_raw_config
-
-        cmd_mcp_add(_make_args(name="chrome-devtools", preset="local-cdp"))
-        out = capsys.readouterr().out
-        assert "Saved" in out
-
-        srv = read_raw_config()["mcp_servers"]["chrome-devtools"]
-        assert srv["command"] == "npx"
-        assert "chrome-devtools-mcp@latest" in srv["args"]
-        assert "--browserUrl=http://127.0.0.1:9222" in srv["args"]
-        assert srv["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"] == "1"
-
-    def test_preset_env_merges_with_explicit_env(
-        self, tmp_path, capsys, monkeypatch
-    ):
-        monkeypatch.setattr(
-            "hermes_cli.mcp_config._MCP_PRESETS",
-            {
-                "envmcp": {
-                    "command": "npx",
-                    "args": ["env-mcp"],
-                    "env": {"SAFE_DEFAULT": "1"},
-                }
-            },
-        )
-        fake_tools = [FakeTool("ping", "Ping")]
-
-        def mock_probe(name, config, **kw):
-            assert config["env"] == {"SAFE_DEFAULT": "1", "EXTRA_FLAG": "yes"}
-            return [(t.name, t.description) for t in fake_tools]
-
-        monkeypatch.setattr(
-            "hermes_cli.mcp_config._probe_single_server", mock_probe
-        )
-        monkeypatch.setattr("builtins.input", lambda _: "")
-
-        from hermes_cli.mcp_config import cmd_mcp_add
-        from hermes_cli.config import read_raw_config
-
-        cmd_mcp_add(
-            _make_args(
-                name="env-server",
-                preset="envmcp",
-                env=["EXTRA_FLAG=yes"],
-            )
-        )
-
-        srv = read_raw_config()["mcp_servers"]["env-server"]
-        assert srv["env"] == {"SAFE_DEFAULT": "1", "EXTRA_FLAG": "yes"}
 
     def test_unknown_preset_rejected(self, capsys):
         """An unknown preset name is rejected with a clear error."""
@@ -574,6 +484,102 @@ class TestEnvVarInterpolation:
 
 
 # ---------------------------------------------------------------------------
+# Tests: probe-path env resolution (#37792)
+# ---------------------------------------------------------------------------
+
+class TestProbeEnvResolution:
+    """The probe path must resolve ``${ENV}`` before connecting, so the
+    discovery probe behaves like runtime tool loading. Regression for #37792
+    where `hermes mcp add --auth header` sent a literal
+    ``Authorization: Bearer ${MCP_X_API_KEY}`` and got 401."""
+
+    def test_resolve_interpolates_header(self, monkeypatch):
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        monkeypatch.setenv("MCP_N8N_API_KEY", "jwt-token-xyz")
+        resolved = _resolve_mcp_server_config({
+            "url": "http://localhost:5678/mcp-server/http",
+            "headers": {"Authorization": "Bearer ${MCP_N8N_API_KEY}"},
+        })
+        assert resolved["headers"]["Authorization"] == "Bearer jwt-token-xyz"
+
+    def test_resolve_leaves_unset_var_literal(self, monkeypatch):
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        monkeypatch.delenv("MCP_UNSET_API_KEY", raising=False)
+        resolved = _resolve_mcp_server_config({
+            "headers": {"Authorization": "Bearer ${MCP_UNSET_API_KEY}"},
+        })
+        # Unresolved placeholder stays literal (no crash) — matches
+        # _interpolate_env_vars semantics.
+        assert resolved["headers"]["Authorization"] == "Bearer ${MCP_UNSET_API_KEY}"
+
+    def test_probe_resolves_before_connect(self, monkeypatch):
+        """_probe_single_server must pass the RESOLVED config to _connect_server."""
+        import hermes_cli.mcp_config as mc
+
+        monkeypatch.setenv("MCP_N8N_API_KEY", "jwt-token-xyz")
+
+        seen = {}
+
+        class _FakeTool:
+            name = "do_thing"
+            description = "a tool"
+
+        class _FakeServer:
+            _tools = [_FakeTool()]
+
+            async def shutdown(self):
+                return None
+
+        async def _fake_connect(name, config):
+            seen["config"] = config
+            return _FakeServer()
+
+        monkeypatch.setattr("tools.mcp_tool._connect_server", _fake_connect)
+
+        tools = mc._probe_single_server("n8n", {
+            "url": "http://localhost:5678/mcp-server/http",
+            "headers": {"Authorization": "Bearer ${MCP_N8N_API_KEY}"},
+        })
+
+        assert tools == [("do_thing", "a tool")]
+        assert seen["config"]["headers"]["Authorization"] == "Bearer jwt-token-xyz"
+
+
+class TestStripBearerPrefix:
+    """Pasted tokens that already include ``Bearer `` would otherwise produce
+    ``Bearer Bearer <jwt>`` once the header template adds its own prefix."""
+
+    def test_bare_token_unchanged(self):
+        from hermes_cli.mcp_config import _strip_bearer_prefix
+
+        assert _strip_bearer_prefix("eyJabc123") == "eyJabc123"
+
+    def test_strips_bearer_prefix(self):
+        from hermes_cli.mcp_config import _strip_bearer_prefix
+
+        assert _strip_bearer_prefix("Bearer eyJabc123") == "eyJabc123"
+
+    def test_strips_case_insensitive_and_whitespace(self):
+        from hermes_cli.mcp_config import _strip_bearer_prefix
+
+        assert _strip_bearer_prefix("bearer eyJabc123") == "eyJabc123"
+        assert _strip_bearer_prefix("  Bearer   eyJabc123  ") == "eyJabc123"
+
+    def test_does_not_strip_without_space(self):
+        from hermes_cli.mcp_config import _strip_bearer_prefix
+
+        # "BearerToken" is a token that happens to start with "Bearer", not a prefix.
+        assert _strip_bearer_prefix("BearerToken") == "BearerToken"
+
+    def test_non_string_passthrough(self):
+        from hermes_cli.mcp_config import _strip_bearer_prefix
+
+        assert _strip_bearer_prefix(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # Tests: config helpers
 # ---------------------------------------------------------------------------
 
@@ -624,80 +630,6 @@ class TestDispatcher:
         mcp_command(_make_args(mcp_action=None))
         out = capsys.readouterr().out
         assert "Commands:" in out or "No MCP servers" in out
-
-
-class TestMcpSmoke:
-    def test_smoke_defaults_chrome_devtools_to_list_pages(
-        self, tmp_path, capsys, monkeypatch
-    ):
-        _seed_config(tmp_path, {
-            "chrome-devtools": {
-                "command": "npx",
-                "args": ["-y", "chrome-devtools-mcp@latest"],
-            },
-        })
-
-        calls = {}
-
-        def fake_call(name, cfg, tool_name, arguments):
-            calls.update({"name": name, "tool": tool_name, "arguments": arguments})
-            return types.SimpleNamespace(
-                content=[types.SimpleNamespace(text='{"pages": []}')]
-            )
-
-        monkeypatch.setattr(
-            "hermes_cli.mcp_config._call_single_server_tool", fake_call
-        )
-
-        from hermes_cli.mcp_config import cmd_mcp_smoke
-        cmd_mcp_smoke(_make_args(name="chrome-devtools", tool=None, arguments="{}"))
-
-        out = capsys.readouterr().out
-        assert "Smoke passed" in out
-        assert calls == {
-            "name": "chrome-devtools",
-            "tool": "list_pages",
-            "arguments": {},
-        }
-
-    def test_smoke_requires_tool_for_unknown_server_type(self, tmp_path, capsys):
-        _seed_config(tmp_path, {"generic": {"command": "npx", "args": ["some-mcp"]}})
-
-        from hermes_cli.mcp_config import cmd_mcp_smoke
-        cmd_mcp_smoke(_make_args(name="generic", tool=None, arguments="{}"))
-
-        out = capsys.readouterr().out
-        assert "No default smoke tool" in out
-
-    def test_smoke_rejects_non_object_arguments(self, tmp_path, capsys):
-        _seed_config(tmp_path, {
-            "chrome-devtools": {
-                "command": "npx",
-                "args": ["-y", "chrome-devtools-mcp@latest"],
-            },
-        })
-
-        from hermes_cli.mcp_config import cmd_mcp_smoke
-        cmd_mcp_smoke(_make_args(name="chrome-devtools", tool=None, arguments="[]"))
-
-        out = capsys.readouterr().out
-        assert "Invalid --arguments JSON" in out
-
-    def test_smoke_summary_redacts_url_queries(self):
-        from hermes_cli.mcp_config import _summarize_mcp_result
-
-        result = types.SimpleNamespace(
-            content=[
-                types.SimpleNamespace(
-                    text="1: https://accounts.example.test/login?token=secret&next=x"
-                )
-            ]
-        )
-
-        summary = _summarize_mcp_result(result)
-
-        assert "token=secret" not in summary
-        assert "https://accounts.example.test/login?<redacted-query>" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -758,3 +690,59 @@ class TestMcpLogin:
         cmd_mcp_login(_make_args(name="srv"))
         out = capsys.readouterr().out
         assert "no URL" in out or "not an OAuth" in out
+
+    def test_login_false_success_no_token(self, tmp_path, capsys, monkeypatch):
+        """Probe lists tools without auth (Google Drive), but no token landed.
+
+        The server allows tools/list without auth (DCR 400'd), so the probe
+        succeeds yet no OAuth token exists. Login must NOT claim success — it
+        should warn and point the user at pre-registered client_id config.
+        """
+        _seed_config(tmp_path, {
+            "googledrive": {
+                "url": "https://drivemcp.googleapis.com/mcp/v1",
+                "auth": "oauth",
+            },
+        })
+        # Probe returns tools even though auth never completed.
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, cfg: [("search_files", "d"), ("read_file_content", "d")],
+        )
+        # No token file is created → _oauth_tokens_present() returns False.
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="googledrive"))
+        out = capsys.readouterr().out
+
+        assert "no OAuth token was obtained" in out
+        assert "Authenticated" not in out
+        assert "client_id" in out
+
+    def test_login_genuine_success_with_token(self, tmp_path, capsys, monkeypatch):
+        """Probe lists tools AND a token exists → report real success."""
+        _seed_config(tmp_path, {
+            "realserver": {"url": "https://mcp.example.com/mcp", "auth": "oauth"},
+        })
+        token_dir = tmp_path / "mcp-tokens"
+
+        # cmd_mcp_login wipes tokens before probing, then the real OAuth flow
+        # writes a fresh token during the probe. Simulate that: the mocked
+        # probe drops a token file, mirroring a successful authorization.
+        def mock_probe(name, cfg):
+            token_dir.mkdir(exist_ok=True)
+            (token_dir / "realserver.json").write_text('{"access_token": "x"}')
+            return [("a", "d"), ("b", "d"), ("c", "d")]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="realserver"))
+        out = capsys.readouterr().out
+
+        assert "Authenticated — 3 tool(s) available" in out
+        assert "no OAuth token" not in out
+
