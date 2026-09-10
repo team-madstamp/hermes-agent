@@ -33,8 +33,17 @@ pytest.importorskip("mcp")
 class _HangingSession:
     """Stand-in ClientSession whose handshake never completes."""
 
+    def __init__(self):
+        self.initialize_started_at = None
+        self.initialize_cancelled_at = None
+
     async def initialize(self):
-        await asyncio.sleep(3600)
+        self.initialize_started_at = time.monotonic()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.initialize_cancelled_at = time.monotonic()
+            raise
 
 
 class _FakeAsyncCM:
@@ -55,11 +64,6 @@ def _fake_stdio_client(*_args, **_kwargs):
     return _FakeAsyncCM((object(), object()))
 
 
-def _fake_client_session(*_args, **_kwargs):
-    # `async with ClientSession(...) as session` -> a session that hangs.
-    return _FakeAsyncCM(_HangingSession())
-
-
 class TestStdioInitializeTimeout:
     def test_hanging_initialize_is_bounded_not_leaked(self):
         """A stdio server that hangs at ``initialize`` must fail within
@@ -69,10 +73,11 @@ class TestStdioInitializeTimeout:
 
         server = mcp_tool.MCPServerTask("leak-guard")
         config = {"command": "fake-mcp", "args": [], "connect_timeout": 0.2}
+        hanging_session = _HangingSession()
 
         async def drive():
             with patch.object(mcp_tool, "stdio_client", _fake_stdio_client), \
-                 patch.object(mcp_tool, "ClientSession", _fake_client_session), \
+                 patch.object(mcp_tool, "ClientSession", lambda *_a, **_k: _FakeAsyncCM(hanging_session)), \
                  patch.object(_mcp_config, "_resolve_stdio_command", lambda c, e: (c, e)), \
                  patch.object(_mcp_config, "_write_stderr_log_header", lambda *_a, **_k: None), \
                  patch.object(mcp_tool, "_get_mcp_stderr_log", lambda: None), \
@@ -88,8 +93,13 @@ class TestStdioInitializeTimeout:
                 return time.monotonic() - start
 
         elapsed = asyncio.run(drive())
-        assert elapsed < 2.0, (
-            f"_run_stdio blocked {elapsed:.1f}s on a hanging initialize() — the "
-            f"connect_timeout ({config['connect_timeout']}s) bound was not applied; "
-            f"the #59349 subprocess/FD leak has regressed."
+        assert hanging_session.initialize_started_at is not None, (
+            f"_run_stdio did not reach initialize() within the outer guard ({elapsed:.1f}s)"
+        )
+        assert hanging_session.initialize_cancelled_at is not None, (
+            "initialize() was not cancelled"
+        )
+        assert hanging_session.initialize_cancelled_at - hanging_session.initialize_started_at < 1.0, (
+            f"initialize() ran for {hanging_session.initialize_cancelled_at - hanging_session.initialize_started_at:.1f}s "
+            f"after connect_timeout={config['connect_timeout']}s; the handshake bound has regressed"
         )

@@ -190,6 +190,7 @@ def test_refuses_to_run_inside_the_parents_own_process_group():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live_system_guard_bypass
 def test_reaps_a_registered_group_when_the_control_pipe_reaches_eof():
     victim = subprocess.Popen(_VICTIM, start_new_session=True)
     supervisor = subprocess.Popen(
@@ -214,6 +215,7 @@ def test_reaps_a_registered_group_when_the_control_pipe_reaches_eof():
         supervisor.wait(timeout=10)
 
 
+@pytest.mark.live_system_guard_bypass
 def test_leaves_an_unregistered_group_alone_at_eof():
     # The other failure direction, and the more damaging one: a clean Hermes
     # shutdown unregisters as it tears each server down, so EOF must not become
@@ -456,6 +458,7 @@ def test_supervisor_is_released_once_nothing_is_left_to_reap(monkeypatch, all_gr
     assert len(spawned) == 2 and spawned[1].lines() == ["register 333"]
 
 
+@pytest.mark.live_system_guard_bypass
 def test_supervisor_survives_the_real_eof_release():
     """End to end: closing the control pipe with nothing registered exits cleanly."""
     if os.name != "posix":
@@ -632,6 +635,7 @@ def _stdio_connection(child_pid, fake_supervisor):
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.live_system_guard_bypass
 def test_connecting_a_stdio_server_registers_its_real_process_group():
     fake = _FakeSupervisor()
     child = subprocess.Popen(_VICTIM, start_new_session=True)
@@ -649,6 +653,7 @@ def test_connecting_a_stdio_server_registers_its_real_process_group():
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.live_system_guard_bypass
 def test_a_server_that_exited_is_released_on_teardown():
     fake = _FakeSupervisor()
     child = subprocess.Popen(_VICTIM, start_new_session=True)
@@ -678,6 +683,7 @@ def test_a_server_that_exited_is_released_on_teardown():
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.live_system_guard_bypass
 def test_a_server_that_survived_teardown_stays_registered():
     # The case the whole module exists for: teardown did not manage to kill it.
     # Releasing it here would hand the orphan back to nobody.

@@ -184,6 +184,18 @@ def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int
     falling back to a per-pid signal."""
     killpg = getattr(os, "killpg", None)
     if pgid is not None and killpg is not None:
+        # A stale ledger entry can retain a spawn-time PGID after the group has
+        # already exited. Probe liveness before delivering a real signal: on
+        # POSIX killpg(..., 0) is non-destructive, and this also keeps test/live
+        # system guards from treating a dead foreign group as an owned target.
+        try:
+            killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError):
+            # The group may exist but be inaccessible; fall through to the
+            # normal per-group/per-pid error handling below.
+            pass
         if my_pgid is not None and pgid == my_pgid:
             # Child shares the gateway's pgroup: killpg would kill the gateway too, so use
             # per-pid kill. Warn because per-pid kill can't reach grandchildren in this group.

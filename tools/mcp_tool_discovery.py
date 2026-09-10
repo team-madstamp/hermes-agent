@@ -19,6 +19,8 @@ from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
 
 logger = logging.getLogger("tools.mcp_tool")
 
+_MCP_DISCOVERY_MAX_CONCURRENCY = 8
+
 
 def _record_connect_failure(server_name: str) -> None:
     """Stamp a geometric, capped retry cooldown after a failed connect (under ``_lock``)."""
@@ -293,9 +295,14 @@ def _register_lazy_from_cache(new_servers: Dict[str, dict]) -> Tuple[Dict[str, d
 
 
 async def _discover_all(new_servers: Dict[str, dict]) -> None:
-    """Connect every candidate concurrently; record per-server outcome."""
+    semaphore = asyncio.Semaphore(_MCP_DISCOVERY_MAX_CONCURRENCY)
+
+    async def _discover_one(name: str, config: dict):
+        async with semaphore:
+            return await _discover_and_register_server(name, config)
+
     results = await asyncio.gather(
-        *(_discover_and_register_server(name, cfg) for name, cfg in new_servers.items()),
+        *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
         return_exceptions=True)
     for name, result in zip(new_servers, results):
         if isinstance(result, BaseException):
