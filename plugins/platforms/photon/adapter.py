@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import psutil
+
 if TYPE_CHECKING:  # type checkers see httpx as always-imported; runtime keeps it optional
     import httpx
     HTTPX_AVAILABLE = True
@@ -36,8 +38,10 @@ else:
         httpx = None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms._shared import ListenerReadback
 from gateway.platforms._shared import coerce_port as _coerce_port
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+from gateway.platforms._shared import read_tcp_listener_pids
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
@@ -88,8 +92,14 @@ def _runtime_record_path() -> Path:
     return get_hermes_home() / "runtime" / _RUNTIME_RECORD_NAME
 
 
+def _process_create_time(pid: int) -> Optional[float]:
+    try:
+        return float(psutil.Process(pid).create_time())
+    except (psutil.Error, OSError, ValueError):
+        return None
+
+
 def _write_runtime_record(port: int, token: str, pid: int) -> None:
-    """Atomically persist ``{port, token, pid}`` with owner-only perms (best-effort)."""
     import tempfile
     try:
         path = _runtime_record_path()
@@ -99,7 +109,12 @@ def _write_runtime_record(port: int, token: str, pid: int) -> None:
             with contextlib.suppress(OSError):  # perms BEFORE the token hits disk (Windows / odd fs)
                 os.chmod(tmp, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"port": port, "token": token, "pid": pid}, fh)
+                json.dump({
+                    "port": port,
+                    "token": token,
+                    "pid": pid,
+                    "process_create_time": _process_create_time(pid),
+                }, fh)
             os.replace(tmp, path)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -826,34 +841,54 @@ class PhotonAdapter(BasePlatformAdapter):
     # -- Sidecar lifecycle ---------------------------------------------------------
 
     @staticmethod
-    def _quick_stdout(cmd: List[str]) -> Optional[str]:
-        """stdout of a short shell-out, or None if it failed to run."""
-        try:
-            return subprocess.run(  # noqa: S603, S607
-                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5.0,
-                check=False).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+    def _listener_readback(port: int) -> ListenerReadback:
+        return read_tcp_listener_pids(port, runner=subprocess.run)
 
     @classmethod
     def _find_listener_pids(cls, port: int) -> List[int]:
         """PIDs listening on a local TCP port (empty if none/undeterminable)."""
-        out = cls._quick_stdout(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"])
-        return [int(tok) for tok in out.split() if tok.strip().isdigit()] if out is not None else []
+        return list(cls._listener_readback(port).pids)
 
-    @classmethod
-    def _pid_is_sidecar(cls, pid: int) -> bool:
-        """True if ``pid``'s command line is a Photon sidecar (any Hermes checkout)."""
-        out = cls._quick_stdout(["ps", "-p", str(pid), "-o", "command="])
-        return out is not None and "photon/sidecar/index.mjs" in out
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
+    def _verified_recorded_sidecar_process(
+        self, pid: int, record: Any
+    ) -> Optional[psutil.Process]:
         try:
-            os.kill(pid, 0)  # windows-footgun: ok — only called from _reap_stale_sidecar which win32-guards early
-        except OSError:
-            return False
-        return True
+            if not isinstance(record, dict):
+                return None
+            recorded_pid = record.get("pid")
+            recorded_port = record.get("port")
+            if not isinstance(recorded_pid, int) or isinstance(recorded_pid, bool):
+                return None
+            if not isinstance(recorded_port, int) or isinstance(recorded_port, bool):
+                return None
+            if recorded_pid != pid or recorded_port != self._sidecar_port:
+                return None
+            recorded_create_time = record.get("process_create_time")
+            if not isinstance(recorded_create_time, (int, float)) or isinstance(recorded_create_time, bool):
+                return None
+            proc = psutil.Process(pid)
+            if proc.create_time() != float(recorded_create_time) or not proc.is_running():
+                return None
+            expected_node = Path(self._node_bin).expanduser()
+            if not expected_node.is_absolute():
+                resolved_node = shutil.which(str(expected_node))
+                if not resolved_node:
+                    return None
+                expected_node = Path(resolved_node)
+            command = list(proc.cmdline() or [])
+            if len(command) < 2:
+                return None
+            cwd = Path(proc.cwd())
+            actual_script = Path(command[1]).expanduser()
+            if not actual_script.is_absolute():
+                actual_script = cwd / actual_script
+            if Path(proc.exe()).resolve() != expected_node.resolve():
+                return None
+            if actual_script.resolve() != (_sidecar_dir() / "index.mjs").resolve():
+                return None
+            return proc
+        except (psutil.Error, OSError, TypeError, ValueError):
+            return None
 
     async def _reap_stale_sidecar(self) -> None:
         """Kill an orphaned sidecar squatting our port (a SIGKILLed gateway leaves one whose
@@ -866,33 +901,56 @@ class PhotonAdapter(BasePlatformAdapter):
                 await client.post(self._sidecar_url("/healthz"), headers=self._sidecar_headers())
         except httpx.RequestError:
             return  # nothing listening — the normal case
-        # Off the loop: lsof + one `ps` per pid can hold it 5+5·N s, on every reconnect.
-        def _inspect():
-            found = self._find_listener_pids(self._sidecar_port)
-            mine = [pid for pid in found if self._pid_is_sidecar(pid)]
-            return mine, [pid for pid in found if pid not in mine]
-        stale, foreign = await asyncio.to_thread(_inspect)
+        readback = await asyncio.to_thread(self._listener_readback, self._sidecar_port)
         fix = "free it or set PHOTON_SIDECAR_PORT to a different port"
-        if not stale:
-            raise RuntimeError(f"port {self._sidecar_port} is in use by another process "
-                               f"(pids: {foreign or 'unknown'}, not a Photon sidecar) — {fix}")
-
-        def _kill(pid: int, sig: int) -> None:
-            with contextlib.suppress(OSError):
-                os.kill(pid, sig)  # windows-footgun: ok — unreachable on win32 (early return above)
-        for pid in stale:
-            logger.warning("[photon] reaping orphaned sidecar (pid %d) on port %d", pid, self._sidecar_port)
-            _kill(pid, signal.SIGTERM)
-        deadline = time.time() + 3.0
-        while time.time() < deadline and any(self._pid_alive(p) for p in stale):
-            await asyncio.sleep(0.1)
-        for pid in stale:
-            if self._pid_alive(pid):
-                _kill(pid, signal.SIGKILL)  # windows-footgun: ok — unreachable on win32 (early return above)
-        await asyncio.sleep(0.2)  # let the OS release the listening socket
-        if foreign:
+        if readback.state == "unavailable":
             raise RuntimeError(
-                f"port {self._sidecar_port} is also held by non-sidecar processes (pids: {foreign}) — {fix}")
+                f"{readback.reason_code}: port {self._sidecar_port} owner readback failed "
+                f"({readback.detail}) — {fix}"
+            )
+        if not readback.pids:
+            return
+        record = _read_runtime_record()
+        if len(readback.pids) != 1:
+            raise RuntimeError(
+                f"OWNER_UNCONFIRMED: port {self._sidecar_port} is held by "
+                f"pids {list(readback.pids)} without one matching profile runtime identity — {fix}"
+            )
+        proc = self._verified_recorded_sidecar_process(readback.pids[0], record)
+        if proc is None:
+            raise RuntimeError(
+                f"OWNER_UNCONFIRMED: port {self._sidecar_port} is held by "
+                f"pids {list(readback.pids)} without one matching profile runtime identity — {fix}"
+            )
+        logger.warning(
+            "[photon] reaping verified orphaned sidecar (pid %d) on port %d",
+            proc.pid,
+            self._sidecar_port,
+        )
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            return
+        except (psutil.Error, OSError) as exc:
+            raise RuntimeError(
+                f"OWNER_CONFIRMED_STOP_FAILED: could not terminate Photon sidecar pid {proc.pid}: {exc}"
+            ) from exc
+        _, alive = await asyncio.to_thread(psutil.wait_procs, [proc], timeout=3.0)
+        for survivor in alive:
+            try:
+                survivor.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.Error, OSError) as exc:
+                raise RuntimeError(
+                    f"OWNER_CONFIRMED_STOP_FAILED: could not kill Photon sidecar pid {survivor.pid}: {exc}"
+                ) from exc
+        _, alive = await asyncio.to_thread(psutil.wait_procs, alive, timeout=2.0)
+        if alive:
+            raise RuntimeError(
+                f"OWNER_CONFIRMED_STOP_FAILED: Photon sidecar pid {proc.pid} remained live"
+            )
+        await asyncio.sleep(0.2)  # let the OS release the listening socket
 
     async def _ensure_sidecar_deps(self) -> None:
         """Cold-install or refresh sidecar node_modules before spawn (off the loop)."""
@@ -1019,6 +1077,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait(timeout=2.0)
         finally:
             self._sidecar_proc = None
             _delete_runtime_record()

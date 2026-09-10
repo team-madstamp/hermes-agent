@@ -44,12 +44,20 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
 # -- record helpers ----------------------------------------------------------
 
 
-def test_write_read_delete_roundtrip(record_path: Path) -> None:
+def test_write_read_delete_roundtrip(
+    record_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(photon_adapter, "_process_create_time", lambda _pid: 123.5)
     photon_adapter._write_runtime_record(8789, "tok123", 4242)
 
     assert record_path.exists()
     data = json.loads(record_path.read_text(encoding="utf-8"))
-    assert data == {"port": 8789, "token": "tok123", "pid": 4242}
+    assert data == {
+        "port": 8789,
+        "token": "tok123",
+        "pid": 4242,
+        "process_create_time": 123.5,
+    }
     assert photon_adapter._read_runtime_record() == data
 
     photon_adapter._delete_runtime_record()
@@ -126,6 +134,7 @@ def _patch_spawn(
     (sidecar_dir / "node_modules" / "spectrum-ts").mkdir(parents=True)
     monkeypatch.setattr(sidecar_paths, "_SIDECAR_DIR", sidecar_dir)
     monkeypatch.setattr(photon_adapter, "_sidecar_deps_stale", lambda: False)
+    monkeypatch.setattr(photon_adapter, "_process_create_time", lambda _pid: 456.5)
 
     async def _no_reap(self: PhotonAdapter) -> None:
         return None
@@ -161,6 +170,7 @@ async def test_record_written_after_healthz_success(
     assert data["port"] == adapter._sidecar_port
     assert data["token"] == adapter._sidecar_token
     assert data["pid"] == 4242
+    assert data["process_create_time"] == 456.5
 
     # Cleanup so the fake supervisor task doesn't leak between tests.
     if adapter._sidecar_supervisor_task is not None:
@@ -229,5 +239,3 @@ async def test_standalone_send_consumes_record_when_env_missing(
     url, _body, headers = _SendClient.calls[0]
     assert ":9111/" in url
     assert headers["X-Hermes-Sidecar-Token"] == "record-token"
-
-

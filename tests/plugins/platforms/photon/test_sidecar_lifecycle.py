@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 from typing import Any, Dict, List, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -60,6 +61,54 @@ def _capture_kills(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, int]]:
     return kills
 
 
+def test_find_listener_pids_normalizes_lsof_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Done:
+        returncode = 0
+        stdout = "p55555\nf4\np55555\nf5\np44444\nf6\n"
+
+    calls: List[List[str]] = []
+
+    def _run(cmd: List[str], **kwargs: Any) -> _Done:
+        calls.append(cmd)
+        return _Done()
+
+    monkeypatch.setattr(photon_adapter.subprocess, "run", _run)
+
+    assert PhotonAdapter._find_listener_pids(8789) == [44444, 55555]
+    assert calls == [["lsof", "-nP", "-Fp", "-iTCP:8789", "-sTCP:LISTEN"]]
+
+
+def test_find_listener_pids_fails_closed_on_lsof_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _run(cmd: List[str], **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(photon_adapter.subprocess, "run", _run)
+
+    assert PhotonAdapter._find_listener_pids(8789) == []
+
+
+def test_find_listener_pids_falls_back_to_ss(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Done:
+        returncode = 0
+        stdout = 'users:(("node",pid=55555,fd=3),("node",pid=55555,fd=4))'
+
+    calls: List[List[str]] = []
+
+    def _run(cmd: List[str], **kwargs: Any) -> Any:
+        calls.append(cmd)
+        if cmd[0] == "lsof":
+            raise subprocess.TimeoutExpired(cmd, 5)
+        return _Done()
+
+    monkeypatch.setattr(photon_adapter.subprocess, "run", _run)
+
+    assert PhotonAdapter._find_listener_pids(8789) == [55555]
+    assert calls == [
+        ["lsof", "-nP", "-Fp", "-iTCP:8789", "-sTCP:LISTEN"],
+        ["ss", "-ltnHp", "sport = :8789"],
+    ]
+
+
 @pytest.mark.asyncio
 async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
@@ -73,6 +122,117 @@ async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None
     await adapter._reap_stale_sidecar()
 
     assert kills == []
+
+
+@pytest.mark.asyncio
+async def test_reap_refuses_listener_without_profile_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
+    monkeypatch.setattr(
+        adapter,
+        "_listener_readback",
+        lambda _port: photon_adapter.ListenerReadback(
+            "present", (55555,), "lsof", "HOST_LISTENER_PRESENT"
+        ),
+    )
+    monkeypatch.setattr(photon_adapter, "_read_runtime_record", lambda: None)
+    kills = _capture_kills(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="OWNER_UNCONFIRMED"):
+        await adapter._reap_stale_sidecar()
+
+    assert kills == []
+
+
+@pytest.mark.asyncio
+async def test_reap_signals_only_the_matching_recorded_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    sidecar_dir = tmp_path / "sidecar"
+    node_path = tmp_path / "bin" / "node"
+    sidecar_dir.mkdir()
+    node_path.parent.mkdir()
+    monkeypatch.setattr(sidecar_paths, "_SIDECAR_DIR", sidecar_dir)
+    adapter._node_bin = str(node_path)
+
+    proc = MagicMock()
+    proc.pid = 55555
+    proc.create_time.return_value = 123.5
+    proc.is_running.return_value = True
+    proc.exe.return_value = str(node_path)
+    proc.cwd.return_value = str(tmp_path)
+    proc.cmdline.return_value = [str(node_path), str(sidecar_dir / "index.mjs")]
+    record = {
+        "port": adapter._sidecar_port,
+        "token": "old-token",
+        "pid": proc.pid,
+        "process_create_time": 123.5,
+    }
+
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
+    monkeypatch.setattr(
+        adapter,
+        "_listener_readback",
+        lambda _port: photon_adapter.ListenerReadback(
+            "present", (proc.pid,), "lsof", "HOST_LISTENER_PRESENT"
+        ),
+    )
+    monkeypatch.setattr(photon_adapter, "_read_runtime_record", lambda: record)
+    monkeypatch.setattr("psutil.Process", lambda _pid: proc)
+    monkeypatch.setattr("psutil.wait_procs", lambda processes, timeout: (processes, []))
+
+    await adapter._reap_stale_sidecar()
+
+    proc.terminate.assert_called_once_with()
+    mismatched = {**record, "process_create_time": 999.0}
+    assert adapter._verified_recorded_sidecar_process(proc.pid, mismatched) is None
+
+
+@pytest.mark.asyncio
+async def test_stop_sidecar_waits_after_force_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    fake_proc = type(
+        "FakeProc",
+        (),
+        {
+            "pid": 4242,
+            "stdin": None,
+            "wait": lambda self, timeout=None: None,
+            "kill": lambda self: None,
+        },
+    )()
+    waits = iter(
+        [
+            subprocess.TimeoutExpired(["node"], 3.0),
+            subprocess.TimeoutExpired(["node"], 2.0),
+            0,
+        ]
+    )
+    wait_calls: List[float | None] = []
+
+    def _wait(timeout=None):
+        wait_calls.append(timeout)
+        result = next(waits)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    fake_proc.wait = _wait
+    adapter._sidecar_proc = fake_proc
+    adapter._http_client = None
+    adapter._sidecar_supervisor_task = None
+    monkeypatch.setattr(photon_adapter.os, "getpgid", lambda _pid: 4242)
+    monkeypatch.setattr(photon_adapter.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(photon_adapter, "_delete_runtime_record", lambda: None)
+
+    await adapter._stop_sidecar()
+
+    assert wait_calls == [3.0, 2.0, 2.0]
 
 
 @pytest.mark.asyncio
