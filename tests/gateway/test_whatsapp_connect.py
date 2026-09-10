@@ -14,6 +14,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 
 import asyncio
 import signal
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -194,6 +195,7 @@ class TestFileHandleClosedOnError:
         assert result is False
         mock_fh.close.assert_called_once()
         assert adapter._bridge_log_fh is None
+        mock_proc.wait.assert_called()
 
 
 class TestConnectCleanup:
@@ -315,11 +317,119 @@ class TestBridgeRuntimeFailure:
 class TestKillPortProcess:
     """Verify _kill_port_process uses platform-appropriate commands."""
 
+    def test_listener_lookup_falls_back_to_ss_after_lsof_timeout(self):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        def run_side_effect(cmd, **kwargs):
+            if cmd[0] == "lsof":
+                raise subprocess.TimeoutExpired(cmd, 5)
+            assert cmd[0] == "ss"
+            return MagicMock(
+                returncode=0,
+                stdout='users:(("node",pid=55555,fd=3),("node",pid=55555,fd=4))',
+            )
+
+        with patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            side_effect=run_side_effect,
+        ) as mock_run:
+            assert wa._listener_pids_on_port(3000) == [55555]
+
+        assert mock_run.call_args_list[0].args[0][:2] == ["lsof", "-nP"]
+        assert mock_run.call_args_list[1].args[0][0] == "ss"
+
+    def test_listener_lookup_deduplicates_repeated_lsof_records(self):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        with patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout="p55555\nf3\np55555\nf4\np44444\nf5\n",
+                stderr="",
+            ),
+        ) as mock_run:
+            assert wa._listener_pids_on_port(3000) == [44444, 55555]
+
+        mock_run.assert_called_once()
+        command = mock_run.call_args.args[0]
+        assert "-Fp" in command
+        assert "-ti" not in command
+
+    def test_listener_readback_distinguishes_absent_from_unavailable(self):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        absent = MagicMock(returncode=1, stdout="", stderr="")
+        with patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            return_value=absent,
+        ) as mock_run:
+            readback = wa._listener_readback_on_port(3000)
+        assert readback.state == "absent"
+        assert readback.reason_code == "HOST_LISTENER_ABSENT"
+        mock_run.assert_called_once()
+
+        with patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            side_effect=[
+                subprocess.TimeoutExpired(["lsof"], 5),
+                FileNotFoundError("ss"),
+            ],
+        ):
+            readback = wa._listener_readback_on_port(3000)
+        assert readback.state == "unavailable"
+        assert readback.reason_code == "HOST_LISTENER_READBACK_UNAVAILABLE"
+
+    def test_bridge_identity_requires_exact_script_session_and_port(self, tmp_path):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        bridge = tmp_path / "bridge.js"
+        session = tmp_path / "session"
+        proc = MagicMock()
+        proc.create_time.return_value = 123.5
+        proc.cwd.return_value = str(tmp_path)
+        proc.exe.return_value = "/usr/local/bin/node"
+        proc.is_running.return_value = True
+
+        with patch("psutil.Process", return_value=proc), patch.object(
+            wa, "find_node_executable", return_value="/usr/local/bin/node"
+        ):
+            proc.cmdline.return_value = [
+                "/usr/local/bin/node",
+                str(tmp_path / "other.js"),
+                "--port",
+                "3000",
+                "--session",
+                str(session),
+            ]
+            assert wa._verified_bridge_process(4242, bridge, session, 3000) is None
+
+            proc.cmdline.return_value = [
+                "/usr/local/bin/node",
+                str(bridge),
+                "--port",
+                "3000",
+                "--session",
+                str(session),
+            ]
+            assert wa._verified_bridge_process(4242, bridge, session, 3000) is proc
+
+    def test_windows_listener_rows_are_a_deduplicated_pid_set(self):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        netstat_output = (
+            "  TCP    0.0.0.0:3000    0.0.0.0:0    LISTENING    23456\n"
+            "  TCP    127.0.0.1:3000  0.0.0.0:0    LISTENING    12345\n"
+            "  TCP    [::]:3000       [::]:0       LISTENING    23456\n"
+        )
+        with patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=netstat_output),
+        ):
+            assert wa._windows_listener_pids(3000) == [12345, 23456]
+
     @pytest.mark.windows_only
-    def test_uses_netstat_and_taskkill_on_windows(self):
-        """``windows_only``: netstat/taskkill are Windows binaries. The old
-        ``_IS_WINDOWS`` patch selected this branch on Linux, where neither
-        exists, so the mocked argv was the only thing under test."""
+    def test_uses_identity_bound_process_on_windows(self):
         from plugins.platforms.whatsapp.adapter import _kill_port_process
 
         netstat_output = (
@@ -327,30 +437,25 @@ class TestKillPortProcess:
             "  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       12345\n"
             "  TCP    0.0.0.0:3001           0.0.0.0:0              LISTENING       99999\n"
         )
-        mock_netstat = MagicMock(stdout=netstat_output)
-        mock_taskkill = MagicMock()
+        mock_netstat = MagicMock(returncode=0, stdout=netstat_output)
+        verified = MagicMock()
 
         def run_side_effect(cmd, **kwargs):
             if cmd[0] == "netstat":
                 return mock_netstat
-            if cmd[0] == "taskkill":
-                return mock_taskkill
             return MagicMock()
 
         with patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run, \
-             patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
-                   return_value=True):
-            _kill_port_process(3000)
+             patch("plugins.platforms.whatsapp.adapter._verified_bridge_process",
+                   return_value=verified), \
+             patch("psutil.wait_procs", return_value=([verified], [])):
+            assert _kill_port_process(3000, Path("bridge.js"), Path("session")) is True
 
         # netstat called
         assert any(
             call.args[0][0] == "netstat" for call in mock_run.call_args_list
         )
-        # taskkill called with correct PID
-        assert any(
-            call.args[0] == ["taskkill", "/PID", "12345", "/F"]
-            for call in mock_run.call_args_list
-        )
+        verified.kill.assert_called_once_with()
 
     @pytest.mark.windows_only
     def test_windows_refuses_taskkill_on_non_bridge_pid(self):
@@ -365,60 +470,85 @@ class TestKillPortProcess:
 
         def run_side_effect(cmd, **kwargs):
             if cmd[0] == "netstat":
-                return MagicMock(stdout=netstat_output)
+                return MagicMock(returncode=0, stdout=netstat_output)
             return MagicMock()
 
         with patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run, \
-             patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
-                   return_value=False):
-            _kill_port_process(3000)
+             patch("plugins.platforms.whatsapp.adapter._verified_bridge_process",
+                   return_value=None):
+            assert _kill_port_process(3000, Path("bridge.js"), Path("session")) is False
 
         assert not any(
             call.args[0][0] == "taskkill" for call in mock_run.call_args_list
         )
 
 
-    @pytest.mark.linux_only
-    def test_kills_only_listeners_on_linux(self):
-        """POSIX path SIGTERMs only LISTENer PIDs (never clients) — the #43846 fix.
-
-        Replaces the old fuser-based test: ``fuser``/bare ``lsof -i`` also
-        matched client sockets sharing the port number, which closed unrelated
-        processes (a browser tab on the same port). The implementation now
-        resolves listeners via ``_listener_pids_on_port`` and signals only those.
-
-        ``linux_only``: asserts the POSIX ``os.kill``/SIGTERM path, which is
-        genuinely selected here without patching ``_IS_WINDOWS``.
-        """
+    def _assert_verified_posix_listener_stopped(self):
         from plugins.platforms.whatsapp import adapter as wa
 
-        kills = []
-        with patch("plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-                   return_value=[55555]) as mock_listeners, \
-             patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
-                   return_value=True), \
-             patch("plugins.platforms.whatsapp.adapter.os.kill",
-                   side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+        with patch("plugins.platforms.whatsapp.adapter._listener_readback_on_port",
+                   return_value=wa.ListenerReadback(
+                       "present", (55555,), "lsof", "HOST_LISTENER_PRESENT"
+                   )) as mock_listeners, \
+             patch("plugins.platforms.whatsapp.adapter._verified_bridge_process") as verified, \
+             patch("psutil.wait_procs") as wait_procs:
+            proc = MagicMock()
+            proc.pid = 55555
+            verified.return_value = proc
+            wait_procs.return_value = ([proc], [])
+            assert wa._kill_port_process(3000, Path("bridge.js"), Path("session")) is True
 
         mock_listeners.assert_called_once_with(3000)
-        assert kills == [(55555, signal.SIGTERM)]
+        proc.terminate.assert_called_once_with()
 
     @pytest.mark.linux_only
-    def test_non_bridge_listener_is_never_killed(self):
-        """#89614 class: a listener that is not a node bridge is refused."""
+    def test_stops_only_verified_listener_on_linux(self):
+        self._assert_verified_posix_listener_stopped()
+
+    @pytest.mark.macos_only
+    def test_stops_only_verified_listener_on_macos(self):
+        self._assert_verified_posix_listener_stopped()
+
+    def _assert_unverified_posix_listener_refused(self):
         from plugins.platforms.whatsapp import adapter as wa
 
-        kills = []
-        with patch("plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-                   return_value=[55555]), \
-             patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
-                   return_value=False), \
-             patch("plugins.platforms.whatsapp.adapter.os.kill",
-                   side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+        with patch("plugins.platforms.whatsapp.adapter._listener_readback_on_port",
+                   return_value=wa.ListenerReadback(
+                       "present", (55555,), "lsof", "HOST_LISTENER_PRESENT"
+                   )), \
+             patch("plugins.platforms.whatsapp.adapter._verified_bridge_process",
+                   return_value=None):
+            assert wa._kill_port_process(3000, Path("bridge.js"), Path("session")) is False
 
-        assert kills == []
+    def test_mixed_listener_set_is_verified_before_any_signal(self):
+        from plugins.platforms.whatsapp import adapter as wa
+
+        verified_proc = MagicMock()
+        with patch(
+            "plugins.platforms.whatsapp.adapter._listener_readback_on_port",
+            return_value=wa.ListenerReadback(
+                "present", (55555, 66666), "lsof", "HOST_LISTENER_PRESENT"
+            ),
+        ), patch(
+            "plugins.platforms.whatsapp.adapter._verified_bridge_process",
+            side_effect=[verified_proc, None],
+        ) as verify, patch(
+            "plugins.platforms.whatsapp.adapter._stop_verified_processes"
+        ) as stop:
+            assert wa._kill_port_process(
+                3000, Path("bridge.js"), Path("session")
+            ) is False
+
+        assert [call.args[0] for call in verify.call_args_list] == [55555, 66666]
+        stop.assert_not_called()
+
+    @pytest.mark.linux_only
+    def test_unverified_listener_is_refused_on_linux(self):
+        self._assert_unverified_posix_listener_refused()
+
+    @pytest.mark.macos_only
+    def test_unverified_listener_is_refused_on_macos(self):
+        self._assert_unverified_posix_listener_refused()
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +569,8 @@ class TestHttpSessionLifecycle:
         adapter = _make_adapter()
         mock_proc = MagicMock()
         mock_proc.pid = 12345
-        mock_proc.poll.side_effect = [0]
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
         adapter._bridge_process = mock_proc
         adapter._poll_task = None
         adapter._http_session = None

@@ -6,14 +6,20 @@ import logging
 import os
 import platform
 import re
-import signal
 import subprocess
+from collections.abc import Iterable
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from gateway.platforms._shared import get_scoped_secret
+import psutil
+
+from gateway.platforms._shared import (
+    ListenerReadback,
+    get_scoped_secret,
+    read_tcp_listener_pids,
+)
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (find_node_executable, get_hermes_dir, with_hermes_node_path)
 
@@ -32,20 +38,16 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
 
-def _listener_pids_on_port(port: int) -> list:
-    """PIDs *listening* on ``port`` (POSIX), never clients — a bare ``lsof -i :PORT`` once killed the user's browser."""
-    pids: list = []
-    with suppress(FileNotFoundError):  # lsof not installed — fall through to ss
-        pids = _safe_ints(subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"], timeout=5, **_RUN_TEXT).stdout.strip().splitlines())
-        if pids:
-            return pids
-    with suppress(FileNotFoundError):
-        pids.extend(int(m.group(1)) for m in re.finditer(r"pid=(\d+)", subprocess.run(["ss", "-ltnHp", f"sport = :{port}"], timeout=5, **_RUN_TEXT).stdout))
-    return pids
+def _listener_readback_on_port(port: int) -> ListenerReadback:
+    return read_tcp_listener_pids(port, runner=subprocess.run)
 
 
-def _safe_ints(tokens) -> list:
-    out: list = []
+def _listener_pids_on_port(port: int) -> list[int]:
+    return list(_listener_readback_on_port(port).pids)
+
+
+def _safe_ints(tokens: Iterable[str]) -> list[int]:
+    out: list[int] = []
     for tok in tokens:
         try:
             out.append(int(tok))
@@ -54,58 +56,156 @@ def _safe_ints(tokens) -> list:
     return out
 
 
-def _windows_listener_pids(port: int) -> list:
+def _windows_listener_pids(port: int) -> list[int]:
     """PIDs in LISTENING state on ``port`` via netstat (Windows)."""
     from hermes_cli._subprocess_compat import windows_hide_flags
-    result = subprocess.run(["netstat", "-ano", "-p", "TCP"], timeout=5, creationflags=windows_hide_flags(), **_RUN_TEXT)
+    result = subprocess.run(
+        ["netstat", "-ano", "-p", "TCP"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        timeout=5,
+        creationflags=windows_hide_flags(),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, result.args)
     rows = (line.split() for line in result.stdout.splitlines())
-    return _safe_ints(p[4] for p in rows if len(p) >= 5 and p[3] == "LISTENING" and p[1].endswith(f":{port}"))
+    return sorted(set(_safe_ints(
+        p[4]
+        for p in rows
+        if len(p) >= 5
+        and p[3] == "LISTENING"
+        and p[1].endswith(f":{port}")
+    )))
 
 
-def _pid_looks_like_node_bridge(pid: int) -> bool:
-    """Fail-closed: the live process must be a ``node`` executable (a scan-time PID can be a stranger by kill time).
+def _resolved_process_path(token: str, cwd: str) -> Path:
+    path = Path(token).expanduser()
+    return (Path(cwd) / path).resolve() if not path.is_absolute() else path.resolve()
 
-    ``_kill_port_process`` discovers PIDs from a netstat/lsof scan of a TCP port — a bare number naming a
-    *stranger* process (#89614 class: an unverified scan-time PID force-killed later can be anything,
-    including a critical system process). Before any kill, require the live process to actually look like
-    our Baileys bridge: a ``node`` executable. Any ambiguity (process gone, unreadable cmdline) refuses the
-    kill.
-    """
+
+def _command_value(command: list[str], flag: str) -> Optional[str]:
     try:
-        import psutil
+        index = command.index(flag)
+        return command[index + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _verified_bridge_process(
+    pid: int,
+    bridge_path: Path,
+    session_path: Path,
+    port: int,
+) -> Optional[psutil.Process]:
+    try:
         proc = psutil.Process(pid)
-        return "node" in (proc.name() or "").lower() or "node" in " ".join(proc.cmdline() or []).lower().split(" ", 1)[0]
-    except Exception:
-        return False
+        expected_node = find_node_executable("node")
+        command = list(proc.cmdline() or [])
+        cwd = proc.cwd()
+        if not expected_node or len(command) < 2:
+            return None
+        if _resolved_process_path(proc.exe(), cwd) != Path(expected_node).resolve():
+            return None
+        if _resolved_process_path(command[1], cwd) != bridge_path.expanduser().resolve():
+            return None
+        session_value = _command_value(command, "--session")
+        if session_value is None or _resolved_process_path(session_value, cwd) != session_path.expanduser().resolve():
+            return None
+        if _command_value(command, "--port") != str(port):
+            return None
+        if proc.create_time() <= 0 or not proc.is_running():
+            return None
+        return proc
+    except (psutil.Error, OSError, ValueError):
+        return None
 
 
-def _kill_port_process(port: int) -> None:
-    """Kill any node bridge *listening* on the given TCP port (never a client); SIGTERM on POSIX, taskkill /F on Windows."""
-    with suppress(Exception):
-        for pid in (_windows_listener_pids(port) if _IS_WINDOWS else _listener_pids_on_port(port)):
-            # Killing a mistyped or recycled PID is unrecoverable — verify first.
-            if pid <= 0 or not _pid_looks_like_node_bridge(pid):
-                logger.warning("[whatsapp] Not killing PID %s on port %d: process is not a node bridge (or identity unverifiable)", pid, port)
-                continue
-            if _IS_WINDOWS:
-                from hermes_cli._subprocess_compat import windows_hide_flags
-                # Only SubprocessError is swallowed per-PID; an OSError (e.g. taskkill missing) aborts the scan.
-                with suppress(subprocess.SubprocessError):
-                    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, stdin=subprocess.DEVNULL, timeout=5, creationflags=windows_hide_flags())
-            else:
-                with suppress(OSError):  # ProcessLookupError/PermissionError are OSError subclasses
-                    os.kill(pid, signal.SIGTERM)
+def _stop_verified_processes(
+    processes: list[psutil.Process], *, force: bool
+) -> bool:
+    signalled = []
+    for proc in processes:
+        try:
+            (proc.kill if force else proc.terminate)()
+            signalled.append(proc)
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError) as exc:
+            logger.warning("[whatsapp] Could not stop verified bridge PID %s: %s", proc.pid, exc)
+            return False
+    _, alive = psutil.wait_procs(signalled, timeout=3.0)
+    for proc in alive:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError) as exc:
+            logger.warning("[whatsapp] Could not force-stop verified bridge PID %s: %s", proc.pid, exc)
+            return False
+    _, alive = psutil.wait_procs(alive, timeout=2.0)
+    return not alive
 
 
-def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
-    """``pid`` alive AND still our bridge: kernel start time (definitive), else legacy ``node`` + session path in cmdline."""
+def _kill_port_process(port: int, bridge_path: Path, session_path: Path) -> bool:
+    if _IS_WINDOWS:
+        try:
+            pids = _windows_listener_pids(port)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("[whatsapp] HOST_LISTENER_READBACK_UNAVAILABLE on port %d", port)
+            return False
+    else:
+        readback = _listener_readback_on_port(port)
+        if readback.state == "unavailable":
+            logger.warning(
+                "[whatsapp] %s on port %d (%s)",
+                readback.reason_code,
+                port,
+                readback.detail,
+            )
+            return False
+        pids = list(readback.pids)
+    if not pids:
+        return True
+
+    verified = []
+    for pid in pids:
+        proc = _verified_bridge_process(pid, bridge_path, session_path, port)
+        if proc is None:
+            logger.warning(
+                "[whatsapp] OWNER_UNCONFIRMED: refusing to stop PID %s on port %d",
+                pid,
+                port,
+            )
+            return False
+        verified.append(proc)
+    return _stop_verified_processes(verified, force=_IS_WINDOWS)
+
+
+def _verified_pidfile_process(
+    pid: int,
+    expected_start: Optional[int],
+    bridge_path: Path,
+    session_path: Path,
+    port: int,
+) -> Optional[psutil.Process]:
     from gateway import status
-    if not status._pid_exists(pid):
-        return False
-    if expected_start is not None:
-        return status.get_process_start_time(pid) == expected_start
-    cmdline = status._read_process_cmdline(pid)
-    return bool(cmdline) and ("node" in cmdline) and (str(session_path) in cmdline)
+    if expected_start is None:
+        return None
+    try:
+        proc = _verified_bridge_process(
+            pid, bridge_path, session_path, port
+        )
+        if proc is None:
+            return None
+        if status.get_process_start_time(pid) != expected_start:
+            return None
+        return proc
+    except (psutil.Error, OSError, ValueError):
+        return None
 
 
 def _unlink_quietly(path: Path) -> None:
@@ -113,8 +213,9 @@ def _unlink_quietly(path: Path) -> None:
         path.unlink()
 
 
-def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
-    """Kill an orphaned bridge recorded in ``bridge.pid``, after :func:`_bridge_pid_is_ours`."""
+def _kill_stale_bridge_by_pidfile(
+    session_path: Path, bridge_path: Path, port: int
+) -> None:
     from gateway.status import _pid_exists
     pid_file = session_path / "bridge.pid"
     if not pid_file.exists():
@@ -126,13 +227,14 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     except (ValueError, OSError, TypeError, IndexError):
         _unlink_quietly(pid_file)
         return
-    if _bridge_pid_is_ours(pid, session_path, recorded_start):
-        with suppress(OSError):  # ProcessLookupError / PermissionError included
-            os.kill(pid, signal.SIGTERM)
+    proc = _verified_pidfile_process(
+        pid, recorded_start, bridge_path, session_path, port
+    )
+    if proc is not None:
+        if _stop_verified_processes([proc], force=False):
             logger.info("[whatsapp] Killed stale bridge PID %d from pidfile", pid)
     elif _pid_exists(pid):
-        logger.warning("[whatsapp] Not killing pidfile PID %d: it is no longer the bridge (recycled onto an unrelated process); "
-                       "skipping to avoid killing a stranger.", pid)
+        logger.warning("[whatsapp] OWNER_UNCONFIRMED: not killing pidfile PID %d", pid)
     _unlink_quietly(pid_file)
 
 
@@ -466,8 +568,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._session_path.mkdir(parents=True, exist_ok=True)
             if await self._reuse_running_bridge(bridge_path):
                 return True
-            _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
+            _kill_stale_bridge_by_pidfile(
+                self._session_path, bridge_path, self._bridge_port
+            )
+            if not _kill_port_process(
+                self._bridge_port, bridge_path, self._session_path
+            ):
+                self._set_fatal_error(
+                    "whatsapp_bridge_port_owner_unconfirmed",
+                    f"OWNER_UNCONFIRMED on WhatsApp bridge port {self._bridge_port}; "
+                    "Hermes refused to stop an unverified listener.",
+                    retryable=True,
+                )
+                return False
             await asyncio.sleep(1)
             # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
             self._bridge_log = self._session_path.parent / "bridge.log"
@@ -488,6 +601,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return False
         finally:
             if not self._running:
+                if self._bridge_process is not None:
+                    try:
+                        await self._stop_managed_bridge()
+                    except Exception as exc:
+                        logger.warning("[%s] Failed to reap bridge after startup failure: %s", self.name, exc)
+                    self._bridge_process = None
                 if lock_acquired:
                     self._release_platform_lock()
                 self._close_bridge_log()
@@ -520,6 +639,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except (ProcessLookupError, PermissionError):
             getattr(self._bridge_process, "kill" if force else "terminate")()
 
+    async def _stop_managed_bridge(self) -> None:
+        proc = self._bridge_process
+        if proc is None:
+            return
+        if proc.poll() is None:
+            self._terminate_bridge(force=False)
+        try:
+            await asyncio.to_thread(proc.wait, 3.0)
+        except subprocess.TimeoutExpired:
+            self._terminate_bridge(force=True)
+            await asyncio.to_thread(proc.wait, 2.0)
+
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         self._shutting_down = True  # flip BEFORE signalling so send()/poll loop don't report the intentional exit as fatal
@@ -527,10 +658,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] Disconnecting (external bridge left running)")
         else:
             try:
-                self._terminate_bridge(force=False)
-                await asyncio.sleep(1)
-                if self._bridge_process.poll() is None:
-                    self._terminate_bridge(force=True)
+                await self._stop_managed_bridge()
             except Exception as e:
                 print(f"[{self.name}] Error stopping bridge: {e}")
         _unlink_quietly(self._session_path / "bridge.pid")
