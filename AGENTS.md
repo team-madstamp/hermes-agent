@@ -264,6 +264,8 @@ families: `hermes_state.py` (21), `gateway/run.py` (15), `tools/mcp_tool.py` (15
   `hermes_cli.update_cmd._hermes_holder_subcommand`; flag sets are DERIVED from the parser
   (`_holder_value_flags()`), never hand-written; match FULL cmdlines and truncate only for
   display. Details: `hermes_cli/AGENTS.md`.
+- Listener observation, port-owner cleanup, process signals, and teardown changes must also
+  follow `.omo/rules/listener-process-safety.md`.
 - **Never hardcode `~/.hermes`.** `get_hermes_home()` for code paths, `display_hermes_home()`
   for user-facing text (both from `hermes_constants`). Hardcoding breaks profiles (5 bugs in
   PR #3575). Module-level constants are fine — they cache after `_apply_profile_override()`
