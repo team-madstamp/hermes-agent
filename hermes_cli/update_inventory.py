@@ -8,8 +8,11 @@ side-effect-free probe, so ``hermes update --plan`` is safe on a live fleet.
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,7 @@ def _detect_supervisor_for_pid(pid: int, service_pids: set, windows_service_pids
 _RESTART_MECHANISMS = {
     "systemd": "systemd", "launchd": "launchd", "desktop": "desktop",
     "windows-service": "windows-service", "manual-serve": "respawn-argv",
+    "process-scan": "manual-review",
 }
 
 _MECHANISM_DESCRIPTIONS = {
@@ -79,9 +83,11 @@ _MECHANISM_DESCRIPTIONS = {
     "desktop": "Desktop app respawns its serve backend",
     "windows-service": "sc.exe stop before venv mutation, sc.exe start after update",
     "respawn-argv": "stop before code swap, relaunch with recorded launch args",
+    "manual-review": "manual review; process-scan found no verified lifecycle owner",
 }
 
 _SERVE_KINDS = ("serve", "dashboard")
+_UNKNOWN_PROFILE = "<unknown>"
 
 
 def _restart_mechanism(supervisor: str, profile: str) -> str:
@@ -97,6 +103,8 @@ def _restart_mechanism(supervisor: str, profile: str) -> str:
 
 def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     """Human-readable description of a restart mechanism id."""
+    if profile == _UNKNOWN_PROFILE:
+        return "profile identity unresolved; no automatic restart"
     return _MECHANISM_DESCRIPTIONS.get(mechanism) or (
         f"hermes -p {profile} gateway restart" if profile != "default" else "hermes gateway restart"
     )
@@ -204,6 +212,57 @@ def _collect_gateway_runtimes(plan: UpdatePlan, profile_homes: list, seen: set[i
                 plan.runtimes.append(_runtime("gateway", proc.profile, proc.pid, supervisor(proc.pid)))
 
 
+def _live_process_argv(pid: object, create_time: object = None) -> list[str] | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        import psutil
+
+        process = psutil.Process(pid)
+        if create_time is not None and abs(float(process.create_time()) - float(create_time)) >= 2.0:
+            return None
+        return [str(value) for value in (process.cmdline() or [])]
+    except Exception:
+        return None
+
+
+def _valid_profile_name(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        from hermes_cli.profiles import _PROFILE_ID_RE
+
+        return candidate if _PROFILE_ID_RE.fullmatch(candidate) else None
+    except Exception:
+        return None
+
+
+def _profile_from_live_process_argv(argv: list[str] | None) -> str | None:
+    if not argv:
+        return None
+    try:
+        from hermes_cli.dashboard_procs import _dashboard_subcommand_index, _profile_flag_value
+
+        if _dashboard_subcommand_index(argv) is None:
+            return None
+        return _valid_profile_name(_profile_flag_value(argv))
+    except Exception:
+        return None
+
+
+def _resolve_ledger_profile(entry: dict) -> tuple[str, str]:
+    recorded = _valid_profile_name(entry.get("profile"))
+    live = _profile_from_live_process_argv(
+        _live_process_argv(entry.get("pid"), entry.get("create_time"))
+    )
+    if live:
+        return live, "live_process_argv_conflict" if recorded and recorded != live else "live_process_argv"
+    if recorded:
+        return recorded, "ledger"
+    return _UNKNOWN_PROFILE, "unknown"
+
+
 def _collect_ledger_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
     """Serve/dashboard backends from the spawn ledger — runtimes the gateway collectors can never see
     (a manual `hermes serve --host <ip>` for a remote Desktop, a long-lived `hermes dashboard`).
@@ -217,14 +276,207 @@ def _collect_ledger_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
             if purpose not in _SERVE_KINDS or not isinstance(pid, int) or pid in seen:
                 continue
             seen.add(pid)
+            profile, profile_source = _resolve_ledger_profile(entry)
             # detail.create_time: process incarnation, not just the numeric PID — a post-update
             # survivor probe comparing PIDs alone calls a NEW serve that reused the number a survivor.
             plan.runtimes.append(_runtime(
-                str(purpose), str(entry.get("profile") or "default"), pid,
+                str(purpose), profile, pid,
                 "desktop" if spawner_is_dead(entry) is False else "manual-serve",
                 detail={
                     "argv": entry.get("argv") or "", "host": entry.get("host") or "",
                     "port": entry.get("port"), "create_time": entry.get("create_time"),
+                    "profile_source": profile_source,
+                },
+            ))
+
+
+def _process_scan_rows() -> list[tuple[int, str]]:
+    from hermes_cli.dashboard_procs import _iter_process_table
+
+    return _iter_process_table()
+
+
+def _process_environment(pid: int) -> dict[str, str]:
+    try:
+        import psutil
+
+        env = psutil.Process(int(pid)).environ()
+        return {str(k): str(v) for k, v in env.items() if k in {
+            "HERMES_HOME", "HERMES_DESKTOP", "HERMES_PARENT_PID",
+        }}
+    except Exception:
+        return {}
+
+
+def _process_create_time(pid: int) -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def _process_parent(pid: int) -> tuple[int | None, str]:
+    try:
+        import psutil
+
+        process = psutil.Process(int(pid))
+        parent = process.parent()
+        if parent is None:
+            return None, ""
+        return int(parent.pid), " ".join(str(v) for v in (parent.cmdline() or []))
+    except Exception:
+        return None, ""
+
+
+def _process_home(pid: int, env: dict[str, str]) -> str | None:
+    if env.get("HERMES_HOME"):
+        return env["HERMES_HOME"]
+    with suppress(Exception):
+        from hermes_cli.dashboard_procs import _hermes_home_for_pid
+
+        return _hermes_home_for_pid(pid)
+    return None
+
+
+def _resolved_path(value: object) -> Path | None:
+    if not value:
+        return None
+    try:
+        return Path(str(value)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _path_is_within(candidate: Path | None, root: Path | None) -> bool:
+    if candidate is None or root is None:
+        return False
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _process_install_match(command: str, hermes_home: str | None) -> str | None:
+    source_root = _resolved_path(Path(__file__).resolve().parents[1])
+    try:
+        command_tokens = shlex.split(str(command or ""), posix=os.name != "nt")
+    except ValueError:
+        command_tokens = str(command or "").split()
+    for token in command_tokens:
+        path_token = str(token).strip().strip("'\"")
+        if path_token.startswith("-") and "=" in path_token:
+            path_token = path_token.split("=", 1)[1]
+        if not os.path.isabs(path_token) and not path_token.startswith("~"):
+            continue
+        candidate = _resolved_path(path_token)
+        if _path_is_within(candidate, source_root):
+            return "command_path"
+    candidate_home = _resolved_path(hermes_home)
+    with suppress(Exception):
+        from hermes_constants import get_default_hermes_root
+
+        root = _resolved_path(get_default_hermes_root())
+        if _path_is_within(candidate_home, root):
+            return "hermes_home"
+    return None
+
+
+def _process_argv(command: str, pid: int) -> tuple[list[str], str]:
+    live = _live_process_argv(pid)
+    if live:
+        return live, "live_process"
+    try:
+        return [str(v) for v in shlex.split(str(command or ""), posix=False)], "process_table"
+    except (TypeError, ValueError):
+        return str(command or "").split(), "process_table"
+
+
+def _flag_value(argv: list[str], name: str) -> str | None:
+    for index, token in enumerate(argv):
+        if token == name and index + 1 < len(argv):
+            return str(argv[index + 1])
+        if token.startswith(f"{name}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _int_flag_value(argv: list[str], name: str) -> int | None:
+    value = _flag_value(argv, name)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _profile_from_process(argv: list[str], hermes_home: str | None) -> tuple[str, str]:
+    try:
+        from hermes_cli.dashboard_procs import _profile_flag_value
+
+        raw = _profile_flag_value(argv)
+    except Exception:
+        raw = None
+    if raw is not None:
+        valid = _valid_profile_name(raw)
+        return (valid, "live_process_argv") if valid else (_UNKNOWN_PROFILE, "invalid_profile")
+    if hermes_home:
+        with suppress(Exception):
+            from hermes_constants import named_profile_home
+
+            named = named_profile_home(hermes_home)
+            valid = _valid_profile_name(named.name if named else None)
+            if valid:
+                return valid, "hermes_home"
+    return "default", "default"
+
+
+def _scan_supervisor(pid: int, env: dict[str, str]) -> tuple[str, str, int | None]:
+    if env.get("HERMES_DESKTOP") != "1":
+        ppid, _ = _process_parent(pid)
+        return "process-scan", "process_table_no_desktop_marker", ppid
+    try:
+        declared_ppid = int(env.get("HERMES_PARENT_PID", ""))
+    except (TypeError, ValueError):
+        declared_ppid = 0
+    actual_ppid, parent_command = _process_parent(pid)
+    if declared_ppid <= 1 or actual_ppid != declared_ppid:
+        return "process-scan", "desktop_marker_parent_mismatch", actual_ppid
+    parent_low = parent_command.lower()
+    if "hermes.app" not in parent_low and "electron" not in parent_low:
+        return "process-scan", "desktop_marker_parent_role_unconfirmed", actual_ppid
+    return "desktop", "desktop_marker_parent_live", actual_ppid
+
+
+def _collect_process_scan_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
+    with _probe("Serve/dashboard process-scan inventory"):
+        from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
+
+        for pid, command in _process_scan_rows():
+            if not isinstance(pid, int) or pid <= 0 or pid in seen:
+                continue
+            argv, argv_source = _process_argv(str(command or ""), pid)
+            purpose = _hermes_holder_subcommand(" ".join(argv)) or _hermes_holder_subcommand(str(command or ""))
+            if purpose not in _SERVE_KINDS:
+                continue
+            env = _process_environment(pid)
+            hermes_home = _process_home(pid, env)
+            install_match = _process_install_match(" ".join(argv) or str(command or ""), hermes_home)
+            if install_match is None:
+                continue
+            profile, profile_source = _profile_from_process(argv, hermes_home)
+            supervisor, supervisor_source, ppid = _scan_supervisor(pid, env)
+            seen.add(pid)
+            plan.runtimes.append(_runtime(
+                str(purpose), profile, pid, supervisor,
+                detail={
+                    "argv": " ".join(argv), "host": _flag_value(argv, "--host") or "",
+                    "port": _int_flag_value(argv, "--port"),
+                    "create_time": _process_create_time(pid), "ppid": ppid,
+                    "hermes_home": hermes_home or "", "profile_source": profile_source,
+                    "argv_source": argv_source, "identity_source": "process_scan_fallback",
+                    "install_match": install_match, "supervisor_source": supervisor_source,
                 },
             ))
 
@@ -251,6 +503,7 @@ def collect_runtime_inventory() -> UpdatePlan:
     seen: set[int] = set()
     _collect_gateway_runtimes(plan, profile_homes, seen)
     _collect_ledger_runtimes(plan, seen)
+    _collect_process_scan_runtimes(plan, seen)
     return plan
 
 

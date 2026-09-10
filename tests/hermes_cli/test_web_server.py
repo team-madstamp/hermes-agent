@@ -3360,6 +3360,33 @@ class TestProbeGatewayHealth:
     """Tests for _probe_gateway_health() — cross-container gateway detection."""
 
 
+    def test_probe_authorizes_detailed_health_with_api_server_key(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_API_KEY", "gateway-secret")
+        requests = []
+
+        def mock_urlopen(req, **kwargs):
+            requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            return mock_resp
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", mock_urlopen)
+
+        alive, body = _web_server_gateway._probe_gateway_health()
+
+        assert alive is True
+        assert body == {"status": "ok"}
+        assert len(requests) == 1
+        assert requests[0].get_header("Authorization") == "Bearer gateway-secret"
+
+
     def test_probe_uses_configured_short_timeout(self, monkeypatch):
         """The HTTP probe must not fall through to the OS TCP timeout."""
         import hermes_cli.web_server as ws
@@ -3407,6 +3434,25 @@ class TestProbeGatewayHealth:
         assert alive is True
         assert body["status"] == "ok"
         assert call_count[0] == 2
+
+
+def test_configured_platform_filter_includes_enabled_failures(monkeypatch):
+    from gateway.config import Platform
+
+    config = SimpleNamespace(
+        platforms={
+            Platform.TELEGRAM: SimpleNamespace(enabled=True),
+            Platform.WHATSAPP: SimpleNamespace(enabled=True),
+            Platform.DISCORD: SimpleNamespace(enabled=False),
+        },
+        get_connected_platforms=lambda: [Platform.TELEGRAM],
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+
+    assert _web_server_gateway._load_configured_gateway_platforms() == {
+        "telegram",
+        "whatsapp",
+    }
 
 
 class TestStatusRemoteGateway:

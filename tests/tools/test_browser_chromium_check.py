@@ -38,6 +38,16 @@ class TestChromiumSearchRoots:
 
 
 class TestChromiumInstalled:
+    def test_false_when_explicit_executable_override_is_missing(self, monkeypatch, tmp_path):
+        missing = tmp_path / "missing-chrome"
+        fallback = tmp_path / "chromium-1208"
+        fallback.mkdir()
+        monkeypatch.setenv("AGENT_BROWSER_EXECUTABLE_PATH", str(missing))
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+        monkeypatch.setattr(shutil, "which", lambda *_args, **_kwargs: None)
+
+        assert bt_install._chromium_installed() is False
+
     def test_true_when_plain_chromium_on_path(self, monkeypatch):
         monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
         monkeypatch.setattr(
@@ -84,5 +94,4 @@ class TestRunBrowserCommandChromiumGuard:
     """Verify _run_browser_command fails fast (no timeout hang) when
     Chromium is missing in local mode.
     """
-
 

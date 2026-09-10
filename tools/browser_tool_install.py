@@ -234,9 +234,13 @@ def _chromium_installed() -> bool:
     if _bt._cached_chromium_installed is not None:
         return _bt._cached_chromium_installed
     ab_path = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+    if ab_path:
+        _bt._cached_chromium_installed = bool(
+            os.path.isfile(ab_path) or shutil.which(ab_path)
+        )
+        return _bt._cached_chromium_installed
     _bt._cached_chromium_installed = bool(
-        (ab_path and (os.path.isfile(ab_path) or shutil.which(ab_path)))
-        or any(shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser", "chrome"))
+        any(shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser", "chrome"))
         or any(root and os.path.isdir(root) and _has_chromium_build(root) for root in _chromium_search_roots())
     )
     return _bt._cached_chromium_installed

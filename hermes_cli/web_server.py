@@ -781,6 +781,7 @@ from hermes_cli.web_server_dashboard import (  # noqa: E402
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
+_GATEWAY_HEALTH_API_KEY = os.getenv("API_SERVER_KEY", "")
 _GATEWAY_HEALTH_TIMEOUT_MAX = 1.0
 try:
     _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "1"))

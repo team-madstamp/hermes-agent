@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -58,7 +59,7 @@ def _live_system_guard_is_active() -> bool:
     ``os.kill`` is still the builtin, the guard never loaded and every kill
     primitive in this file would fire for real.
     """
-    return not isinstance(os.kill, types.BuiltinFunctionType)
+    return bool(getattr(os.kill, "__hermes_live_system_guard__", False))
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +104,11 @@ def test_fail_closed_probe_classifies_raw_builtin_as_unguarded():
     assert not isinstance(os.kill, types.BuiltinFunctionType)
 
 
+def test_fail_closed_probe_rejects_unmarked_python_wrapper(monkeypatch):
+    monkeypatch.setattr(os, "kill", lambda _pid, _sig: None)
+    assert _live_system_guard_is_active() is False
+
+
 # ──────────────────── kill primitives ─────────────────────────
 
 
@@ -117,10 +123,97 @@ def test_os_kill_blocks_negative_one():
         os.kill(-1, signal.SIGTERM)
 
 
+def test_os_kill_allows_live_test_child():
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    try:
+        os.kill(child.pid, signal.SIGTERM)
+        expected = -signal.SIGTERM if os.name == "posix" else signal.SIGTERM
+        assert child.wait(timeout=2) == expected
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
 def test_os_killpg_blocks_foreign_pgid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.killpg(FOREIGN_PID, signal.SIGTERM)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_os_killpg_allows_recorded_private_test_group():
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+        assert child.wait(timeout=2) == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_os_killpg_rechecks_recorded_group_identity(monkeypatch):
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        monkeypatch.setattr(os, "getpgid", lambda _pid: os.getpgrp())
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            os.killpg(child.pid, signal.SIGTERM)
+        assert child.poll() is None
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+_GROUP_TARGET_PROBE = "HERMES_TEST_GROUP_TARGET_PROBE"
+
+
+def test_destructive_group_targets_are_blocked_in_an_isolated_session():
+    if not hasattr(os, "killpg"):
+        pytest.skip("process-group signals are POSIX-only")
+    env = dict(os.environ)
+    env[_GROUP_TARGET_PROBE] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__)),
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-k",
+            "_isolated_group_target_probe",
+        ],
+        env=env,
+        start_new_session=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    os.environ.get(_GROUP_TARGET_PROBE) != "1",
+    reason="runs only inside the isolated process-group probe",
+)
+def test__isolated_group_target_probe():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        os.kill(0, signal.SIGTERM)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        os.killpg(os.getpgrp(), signal.SIGTERM)
 
 
 # ──────────────────── subprocess regex bypasses ────────────────

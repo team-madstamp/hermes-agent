@@ -80,19 +80,18 @@ def _browser_available() -> bool:
 
 
 def _launch_browser_probe(timeout: float) -> tuple:
-    """Launch a browser, open about:blank, close. Returns (ok, detail). Uses Playwright directly (what
-    agent-browser drives underneath) so the probe owns the full lifecycle and always cleans up."""
+    from tools import browser_tool_lifecycle, browser_tool_session
+
+    task_id = f"doctor-live-{os.getpid()}"
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return (False, "playwright not installed")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, timeout=timeout * 1000)
-        try:
-            browser.new_page().goto("about:blank", timeout=timeout * 1000)
-        finally:
-            browser.close()
-    return (True, "launched + about:blank + closed")
+        result = browser_tool_session._run_browser_command(
+            task_id, "open", ["about:blank"], timeout=timeout
+        )
+        if not result.get("success"):
+            return (False, result.get("error") or "agent-browser probe failed")
+        return (True, "launched + about:blank + closed")
+    finally:
+        browser_tool_lifecycle.cleanup_browser(task_id)
 
 
 def _probe_mcp_server(name: str, config: dict, timeout: float):
@@ -193,6 +192,8 @@ def run_live_checks(issues: List[str]) -> List[ProbeResult]:
             def _probe(n=name, e=servers[name]) -> ProbeResult:
                 if not isinstance(e, dict):
                     return ProbeResult(f"MCP: {n}", "skip", "(malformed config entry)")
+                if e.get("enabled") is False:
+                    return ProbeResult(f"MCP: {n}", "skip", "(disabled)")
                 return ProbeResult(f"MCP: {n}", "pass", f"({len(_probe_mcp_server(n, e, timeout))} tool(s))")
             results.append(_run_one(f"MCP: {name}", _probe, issues))
     else:

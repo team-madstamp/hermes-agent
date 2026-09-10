@@ -366,14 +366,25 @@ def _ledger_manual_serve_holders(matches: list[tuple[int, str, str]]) -> list[di
     respawn what we kill). Full entries let the relauncher rebuild from host/port/profile, not argv."""
     try:
         from hermes_cli.process_identity import ledger_entries, spawner_is_dead
+        from hermes_cli.update_inventory import _UNKNOWN_PROFILE, _resolve_ledger_profile
     except Exception:
         return []
     holder_pids = {int(pid) for pid, _name, _cmd in matches}
-    return [
-        entry for entry in ledger_entries()
-        if entry.get("purpose") in _BACKEND_PURPOSES and isinstance(entry.get("pid"), int) and entry["pid"] in holder_pids
-        and spawner_is_dead(entry) is not False  # False = live Desktop supervisor owns it; keep refusing
-    ]
+    resolved = []
+    for entry in ledger_entries():
+        if (entry.get("purpose") not in _BACKEND_PURPOSES
+                or not isinstance(entry.get("pid"), int)
+                or entry["pid"] not in holder_pids
+                or spawner_is_dead(entry) is False):
+            continue
+        profile, profile_source = _resolve_ledger_profile(entry)
+        if profile == _UNKNOWN_PROFILE:
+            continue
+        enriched = dict(entry)
+        enriched["profile"] = profile
+        enriched["profile_source"] = profile_source
+        resolved.append(enriched)
+    return resolved
 
 
 def _serve_relaunch_commands(entries: list[dict]) -> list[list[str]]:
@@ -391,6 +402,8 @@ def _serve_relaunch_commands(entries: list[dict]) -> list[list[str]]:
         if not isinstance(port, int) or port <= 0:
             continue
         profile, host = str(entry.get("profile") or ""), str(entry.get("host") or "")
+        if not profile or profile == "<unknown>":
+            continue
         commands.append(
             [hermes] + (["--profile", profile] if profile and profile != "default" else [])
             + [str(entry.get("purpose"))] + (["--host", host] if host else []) + ["--port", str(port)]

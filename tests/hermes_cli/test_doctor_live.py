@@ -146,6 +146,33 @@ class TestConfiguredOnlySelection:
         assert len(results) == 2
         assert all(r.status == "pass" for r in results)
 
+    def test_disabled_mcp_server_is_skipped_without_probe(self, monkeypatch):
+        monkeypatch.setattr(
+            doctor_live, "_load_config",
+            lambda: {
+                "mcp_servers": {
+                    "active": {"url": "https://active.example/mcp"},
+                    "disabled": {
+                        "url": "https://disabled.example/mcp",
+                        "enabled": False,
+                    },
+                }
+            },
+        )
+        probed = []
+        monkeypatch.setattr(
+            doctor_live,
+            "_probe_mcp_server",
+            lambda name, cfg, timeout: probed.append(name) or [("t", "d")],
+        )
+
+        results = {r.name: r for r in run_live_checks([])}
+
+        assert probed == ["active"]
+        assert results["MCP: active"].status == "pass"
+        assert results["MCP: disabled"].status == "skip"
+        assert results["MCP: disabled"].detail == "(disabled)"
+
     def test_tts_local_provider_skipped(self, monkeypatch):
         monkeypatch.setattr(
             doctor_live, "_load_config",
@@ -228,6 +255,53 @@ class TestBrowserAvailableNpxRung:
         monkeypatch.setattr("tools.browser_tool_install._requires_real_termux_browser_install", lambda cmd: True)
 
         assert _real_browser_available() is False
+
+
+class TestBrowserProbeUsesHermesBackend:
+    def test_agent_browser_backend_is_probed_and_cleaned_up(self, monkeypatch):
+        commands = []
+        cleanups = []
+
+        monkeypatch.setattr(
+            "tools.browser_tool_session._run_browser_command",
+            lambda task_id, command, args, timeout: commands.append(
+                (task_id, command, args, timeout)
+            )
+            or {"success": True},
+        )
+        monkeypatch.setattr(
+            "tools.browser_tool_lifecycle.cleanup_browser",
+            lambda task_id: cleanups.append(task_id),
+        )
+
+        ok, detail = doctor_live._launch_browser_probe(timeout=7.5)
+
+        assert ok is True
+        assert detail == "launched + about:blank + closed"
+        assert commands == [
+            (f"doctor-live-{doctor_live.os.getpid()}", "open", ["about:blank"], 7.5)
+        ]
+        assert cleanups == [f"doctor-live-{doctor_live.os.getpid()}"]
+
+    def test_agent_browser_backend_failure_still_cleans_up(self, monkeypatch):
+        cleanups = []
+        monkeypatch.setattr(
+            "tools.browser_tool_session._run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": False,
+                "error": "Chromium launch failed",
+            },
+        )
+        monkeypatch.setattr(
+            "tools.browser_tool_lifecycle.cleanup_browser",
+            lambda task_id: cleanups.append(task_id),
+        )
+
+        ok, detail = doctor_live._launch_browser_probe(timeout=7.5)
+
+        assert ok is False
+        assert detail == "Chromium launch failed"
+        assert cleanups == [f"doctor-live-{doctor_live.os.getpid()}"]
 
 
 class TestFailureIsolation:

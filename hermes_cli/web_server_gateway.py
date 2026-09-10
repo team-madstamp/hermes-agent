@@ -27,13 +27,19 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     to be replaced by a dashboard config key; do not add callers. Accepts a base URL or an
     explicit ``/health`` / ``/health/detailed`` path; tries ``/health/detailed`` first.
     """
-    from hermes_cli.web_server import _GATEWAY_HEALTH_TIMEOUT, _GATEWAY_HEALTH_URL
+    from hermes_cli.web_server import (
+        _GATEWAY_HEALTH_API_KEY,
+        _GATEWAY_HEALTH_TIMEOUT,
+        _GATEWAY_HEALTH_URL,
+    )
     if not _GATEWAY_HEALTH_URL:
         return False, None
     base = re.sub(r"/health(/detailed)?$", "", _GATEWAY_HEALTH_URL.rstrip("/"))
     for path in (f"{base}/health/detailed", f"{base}/health"):
         try:
             req = urllib.request.Request(path, method="GET")
+            if _GATEWAY_HEALTH_API_KEY:
+                req.add_header("Authorization", f"Bearer {_GATEWAY_HEALTH_API_KEY}")
             with urllib.request.urlopen(req, timeout=_GATEWAY_HEALTH_TIMEOUT) as resp:
                 if resp.status == 200:
                     return True, json.loads(resp.read())
@@ -222,11 +228,15 @@ def _collect_profile_gateway_topology_cached() -> Dict[str, Any]:
 
 
 def _load_configured_gateway_platforms() -> set[str]:
-    """Connected platform names; synchronous by design — the first ``load_gateway_config()`` does
+    """Enabled platform names; synchronous by design — the first ``load_gateway_config()`` does
     platform discovery and can outlast Desktop's WS connect timeout on Windows, so ``get_status``
     runs this in Starlette's worker pool."""
     from gateway.config import load_gateway_config
-    return {platform.value for platform in load_gateway_config().get_connected_platforms()}
+    return {
+        platform.value
+        for platform, config in load_gateway_config().platforms.items()
+        if config.enabled
+    }
 
 
 _WINDOWS_11_MIN_BUILD = 22000
