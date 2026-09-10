@@ -68,15 +68,10 @@ def _no_detached_fallback(monkeypatch):
 
 
 def _supervision_returning(*results):
-    """Fake ``_launchctl_label_supervising_process`` yielding ``results`` in order.
-
-    The final value repeats, so a test can say "False twenty times, then True
-    from then on".
-    """
     seq = list(results)
     calls = []
 
-    def probe(label):
+    def probe(label, **_kwargs):
         calls.append(label)
         return seq[min(len(calls) - 1, len(seq) - 1)]
 
@@ -89,12 +84,24 @@ class TestWaitForLaunchdGatewaySupervision:
         """The common case must not cost a single sleep."""
         monkeypatch.setattr(
             gateway_cli,
-            "_launchctl_label_supervising_process",
+            "_launchd_service_has_live_pid",
             _supervision_returning(True),
         )
 
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
         assert clock.slept == []
+
+    def test_uses_domain_aware_locator(self, monkeypatch, clock):
+        located = []
+
+        def locate(label):
+            located.append(label)
+            return "gui/501", 4242
+
+        monkeypatch.setattr(gateway_cli, "_locate_launchd_gateway_service", locate)
+
+        assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
+        assert located == [LABEL]
 
     def test_waits_out_the_launchd_respawn_throttle(self, monkeypatch, clock):
         """A pid that only appears after ~10s is a SUCCESS, not a failure.
@@ -108,7 +115,7 @@ class TestWaitForLaunchdGatewaySupervision:
         # 0.5s poll interval: 20 misses is ~10s of throttle, then the pid lands.
         probe = _supervision_returning(*([False] * 20 + [True]))
         monkeypatch.setattr(
-            gateway_cli, "_launchctl_label_supervising_process", probe
+            gateway_cli, "_launchd_service_has_live_pid", probe
         )
 
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
@@ -118,7 +125,7 @@ class TestWaitForLaunchdGatewaySupervision:
         """A job that never comes back must fail, and must fail bounded."""
         probe = _supervision_returning(False)
         monkeypatch.setattr(
-            gateway_cli, "_launchctl_label_supervising_process", probe
+            gateway_cli, "_launchd_service_has_live_pid", probe
         )
 
         assert (
@@ -144,7 +151,7 @@ class TestWaitForLaunchdGatewaySupervision:
         )
         probe = _supervision_returning(False)
         monkeypatch.setattr(
-            gateway_cli, "_launchctl_label_supervising_process", probe
+            gateway_cli, "_launchd_service_has_live_pid", probe
         )
 
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True

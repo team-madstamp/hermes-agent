@@ -317,6 +317,7 @@ class TestBuildSlack:
         assert types["C0B0QV5434G"] == "channel"
         assert types["G123ABCDEF"] == "private"
         client.users_conversations.assert_awaited_once()
+        assert client.users_conversations.await_args.kwargs["team_id"] == "T1"
 
     def test_paginates_via_response_metadata_cursor(self, tmp_path):
         client = _make_slack_client([
@@ -397,4 +398,3 @@ class TestChannelAliases:
         names = [e["name"] for e in on_disk["platforms"]["whatsapp"]
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
-

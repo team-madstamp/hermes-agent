@@ -3592,13 +3592,22 @@ def _launchd_reload_budget() -> float:
 
 
 def _launchctl_label_supervising_process(label: str) -> bool:
-    """True when launchd knows ``label`` AND runs a process for it. ``launchctl list`` exits 0 for a
-    mere registered definition (``state = not running`` on macOS 26+), so a positive PID is required."""
     try:
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
         return False
     return result.returncode == 0 and _parse_launchd_pid_from_list_output(result.stdout) is not None
+
+
+def _launchd_service_has_live_pid(label: str, *, domain: str | None = None) -> bool:
+    try:
+        if domain is None:
+            _, pid = _locate_launchd_gateway_service(label)
+        else:
+            _, pid = _launchd_print_service_pid(domain, label)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return pid is not None
 
 
 def _retry_launchctl_bootstrap_until_registered(
@@ -3611,9 +3620,9 @@ def _retry_launchctl_bootstrap_until_registered(
         attempt += 1
         try:
             _launchctl_bootstrap(domain, plist_path, label, timeout=30)
-            if _launchctl_label_supervising_process(label):
+            if _launchd_service_has_live_pid(label, domain=domain):
                 return True
-            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
+            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl print)"
         except subprocess.CalledProcessError as exc:
             outcome = f"failed (rc={exc.returncode}) for {domain}/{label}"
         except subprocess.TimeoutExpired:
@@ -3840,9 +3849,6 @@ def launchd_plist_is_current() -> bool:
 def _spawn_deferred_launchd_reload(
     *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
 ) -> bool:
-    """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
-    helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3853,9 +3859,7 @@ def _spawn_deferred_launchd_reload(
     _reload_budget = int(_launchd_reload_budget())
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
-    # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
-    # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    listed = f"launchctl print {q_target} 2>/dev/null | grep -qE '^[[:space:]]*pid = [0-9]+$'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -4211,8 +4215,7 @@ def wait_for_launchd_gateway_supervision(
     bootstrap (#88848) — nor a ``launchctl bootstrap`` that exits 0 without registering, which the reporter
     measured on macOS 26.6.1.
     Judge the outcome the way #80491 taught the helper to judge it: by a live supervised pid, never by an
-    exit code.  :func:`_launchctl_label_supervising_process` is already that predicate, so this only adds
-    the wait.
+    exit code.  The probe must remain domain-explicit because ``launchctl list`` is caller-session scoped.
     """
     if _launchd_unsupported_marker_exists():
         return True
@@ -4220,7 +4223,7 @@ def wait_for_launchd_gateway_supervision(
     label = label or get_launchd_label()
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
-        if _launchctl_label_supervising_process(label):
+        if _launchd_service_has_live_pid(label):
             return True
         if time.monotonic() >= deadline:
             return False

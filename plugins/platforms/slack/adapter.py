@@ -981,6 +981,7 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_handler_started_monotonic: Optional[float] = None
+        self._socket_transport_confirmed = False
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1135,6 +1136,23 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
             logger.debug("[Slack] Could not inspect Socket Mode transport state", exc_info=True)
             return None
 
+    @property
+    def send_path_degraded(self) -> bool:
+        return not bool(getattr(self, "_socket_transport_confirmed", False))
+
+    def _set_socket_transport_confirmed(self, connected: Optional[bool]) -> None:
+        confirmed = connected is True
+        previous = bool(getattr(self, "_socket_transport_confirmed", False))
+        self._socket_transport_confirmed = confirmed
+        if not getattr(self, "_running", False) or confirmed == previous:
+            return
+        if confirmed:
+            self._write_runtime_status_safe(
+                "connected", platform_state="connected", error_code=None, error_message=None,
+            )
+        else:
+            self._mark_degraded()
+
     def _socket_ping_pong_stale(self) -> bool:
         """No recent ping/pong on the transport. Slack pings every ``ping_interval`` even when idle,
         and a client stuck on a closed session can still report ``is_connected()``, so staleness is
@@ -1163,9 +1181,11 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            self._set_socket_transport_confirmed(False)
             await self._stop_socket_mode_handler()
             try:
                 self._start_socket_mode_handler()
+                self._set_socket_transport_confirmed(await self._socket_transport_connected())
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True)
 
@@ -1182,9 +1202,11 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
                     await self._restart_socket_mode("socket task missing")
                     continue
                 if task.done():
+                    self._set_socket_transport_confirmed(False)
                     await self._restart_socket_mode("socket task stopped")
                     continue
                 connected = await self._socket_transport_connected()
+                self._set_socket_transport_confirmed(connected)
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
                 elif self._socket_ping_pong_stale():
@@ -1249,6 +1271,7 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
             logger.warning("[Slack] Socket Mode task exited with error: %s", exc, exc_info=True)
         else:
             logger.warning("[Slack] Socket Mode task exited unexpectedly")
+        self._set_socket_transport_confirmed(False)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1587,24 +1610,50 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
         _apply_slack_proxy(client, proxy_url)
         return client
 
+    @staticmethod
+    def _configured_workspace_team_ids() -> List[str]:
+        for env_name in (
+            "SLACK_WORKSPACE_TEAM_IDS",
+            "SLACK_WORKSPACE_TEAM_ID",
+            "SLACK_TEAM_ID",
+            "SLACK_WORKSPACE_GRANT_TEAM_ID",
+        ):
+            try:
+                raw = get_secret(env_name)
+            except UnscopedSecretError:
+                raw = os.getenv(env_name)
+            ids = [part.strip() for part in str(raw or "").split(",") if part.strip()]
+            if ids:
+                return list(dict.fromkeys(ids))
+        return []
+
     async def _authenticate_workspace(self, token: str, proxy_url: Optional[str]) -> None:
         """``auth.test`` one bot token and register its workspace client/identity.
         The first token wins as primary identity (cleared before reconnect)."""
         client = self._new_web_client(token, proxy_url)
         auth_response = await client.auth_test()
-        team_id = auth_response.get("team_id", "")
+        auth_team_id = str(auth_response.get("team_id") or "").strip()
+        enterprise_install = bool(auth_response.get("is_enterprise_install")) or auth_team_id.startswith("E")
+        workspace_team_ids = (
+            self._configured_workspace_team_ids() if enterprise_install else [auth_team_id]
+        )
+        workspace_team_ids = list(dict.fromkeys(team_id for team_id in workspace_team_ids if team_id))
+        if not workspace_team_ids and auth_team_id:
+            workspace_team_ids = [auth_team_id]
         bot_user_id = auth_response.get("user_id", "")
         bot_name = auth_response.get("user", "unknown")
         team_name = auth_response.get("team", "unknown")
-        self._team_clients[team_id] = client
-        self._team_bot_user_ids[team_id] = bot_user_id
-        self._team_bot_names[team_id] = bot_name
+        for team_id in workspace_team_ids:
+            self._team_clients[team_id] = client
+            self._team_bot_user_ids[team_id] = bot_user_id
+            self._team_bot_names[team_id] = bot_name
         if self._bot_user_id is None:
             self._bot_user_id = bot_user_id
         if self._bot_display_name is None:
             self._bot_display_name = bot_name
         logger.info(
-            "[Slack] Authenticated as @%s in workspace %s (team: %s)", bot_name, team_name, team_id)
+            "[Slack] Authenticated as @%s in workspace %s (team: %s)",
+            bot_name, team_name, ",".join(workspace_team_ids) or auth_team_id)
         self._warn_if_missing_group_dm_scopes(auth_response, team_name)
         self._warn_if_not_bot_token(auth_response, team_name)
         self._warn_if_inchannel_without_flat_reply(team_name)
@@ -1641,6 +1690,7 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
                 return False
             lock_acquired = True
             self._running = False
+            self._socket_transport_confirmed = False
             # Cancel AND await the old watchdog so it can't see _running=False,
             # exit, and leave no monitor behind.
             await self._cancel_socket_watchdog("[Slack] Prior watchdog task failed while stopping")
@@ -1670,6 +1720,8 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
             try:
                 self._start_socket_mode_handler()
                 self._running = True
+                transport_confirmed = await self._socket_transport_connected()
+                self._set_socket_transport_confirmed(transport_confirmed)
                 self._ensure_socket_watchdog()
             except Exception:
                 self._running = False
@@ -1678,7 +1730,13 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
                 except Exception:  # pragma: no cover - defensive logging
                     logger.debug("[Slack] Cleanup after failed start raised", exc_info=True)
                 raise
-            logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
+            if transport_confirmed is True:
+                logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
+            else:
+                logger.info(
+                    "[Slack] Socket Mode handler started; transport confirmation pending (%d workspace(s))",
+                    len(self._team_clients),
+                )
             self._hint_allow_bots()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1744,6 +1802,7 @@ class SlackAdapter(SlackWisdomMixin, BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        self._socket_transport_confirmed = False
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for chat_id, stream in list(self._active_streams.items()):
             await self._seal_stream(chat_id, stream)

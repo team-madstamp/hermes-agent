@@ -7,11 +7,121 @@ import it at module top level without cycles.
 from __future__ import annotations
 
 import os
-from typing import Any
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
 # Profile-scoped secret reader for multiplexing support (PR #50094)
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+@dataclass(frozen=True)
+class ListenerReadback:
+    state: Literal["present", "absent", "unavailable"]
+    pids: tuple[int, ...]
+    backend: str
+    reason_code: str
+    detail: str = ""
+
+
+def _parse_lsof_pid_fields(stdout: str) -> tuple[int, ...] | None:
+    pids: list[int] = []
+    process_seen = False
+    for field in (line for line in stdout.splitlines() if line):
+        if field.startswith("p"):
+            value = field[1:]
+            if not value.isdigit() or int(value) <= 0:
+                return None
+            pids.append(int(value))
+            process_seen = True
+            continue
+        if field.startswith("f") and process_seen and len(field) > 1:
+            continue
+        return None
+    return tuple(sorted(set(pids)))
+
+
+def read_tcp_listener_pids(
+    port: int,
+    *,
+    runner: Callable[..., Any] | None = None,
+    timeout: float = 5.0,
+) -> ListenerReadback:
+    run = runner or subprocess.run
+    failures: list[str] = []
+    commands = (
+        ("lsof", ["lsof", "-nP", "-Fp", f"-iTCP:{port}", "-sTCP:LISTEN"]),
+        ("ss", ["ss", "-ltnHp", f"sport = :{port}"]),
+    )
+    for backend, command in commands:
+        try:
+            result = run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError:
+            failures.append(f"{backend.upper()}_NOT_FOUND")
+            continue
+        except subprocess.TimeoutExpired:
+            failures.append(f"{backend.upper()}_TIMEOUT")
+            continue
+        except OSError as exc:
+            failures.append(f"{backend.upper()}_OSERROR_{type(exc).__name__}")
+            continue
+
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        if backend == "lsof":
+            if result.returncode == 1 and not stdout.strip() and not stderr.strip():
+                return ListenerReadback(
+                    "absent", (), backend, "HOST_LISTENER_ABSENT"
+                )
+            if result.returncode == 0:
+                pids = _parse_lsof_pid_fields(stdout)
+                if pids is not None:
+                    return ListenerReadback(
+                        "present" if pids else "absent",
+                        pids,
+                        backend,
+                        "HOST_LISTENER_PRESENT" if pids else "HOST_LISTENER_ABSENT",
+                    )
+                failures.append("LSOF_MALFORMED_OUTPUT")
+                continue
+            failures.append(f"LSOF_EXIT_{result.returncode}")
+            continue
+
+        if result.returncode == 0:
+            pids = tuple(sorted({
+                int(match.group(1))
+                for match in re.finditer(r"pid=(\d+)", stdout)
+            }))
+            if pids:
+                return ListenerReadback(
+                    "present", pids, backend, "HOST_LISTENER_PRESENT"
+                )
+            if not stdout.strip():
+                return ListenerReadback(
+                    "absent", (), backend, "HOST_LISTENER_ABSENT"
+                )
+            failures.append("SS_OWNER_UNAVAILABLE")
+            continue
+        failures.append(f"SS_EXIT_{result.returncode}")
+
+    return ListenerReadback(
+        "unavailable",
+        (),
+        ",".join(backend for backend, _ in commands),
+        "HOST_LISTENER_READBACK_UNAVAILABLE",
+        ",".join(failures),
+    )
 
 
 def get_scoped_secret(name: str, default: Any = None) -> Any:

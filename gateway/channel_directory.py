@@ -233,6 +233,7 @@ async def _slack_team_channels(team_id: str, client, seen_ids: set) -> List[Dict
         cursor: Optional[str] = None
         for _page in range(20):  # safety cap on pagination
             response = await client.users_conversations(
+                team_id=team_id,
                 types="public_channel,private_channel", exclude_archived=True, limit=200, cursor=cursor,
             )
             if not response.get("ok"):

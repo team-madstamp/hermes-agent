@@ -483,6 +483,33 @@ class TestAppMentionHandler:
         assert created_handlers[0].app_token == "xapp-default"
 
 
+class TestSlackEnterpriseWorkspaceIdentity:
+    @pytest.mark.asyncio
+    async def test_org_install_uses_declared_workspace_ids(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        client = AsyncMock()
+        client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "user": "testbot",
+                "team_id": "E_ENTERPRISE",
+                "team": "Enterprise",
+                "enterprise_id": "E_ENTERPRISE",
+                "is_enterprise_install": True,
+            }
+        )
+
+        with (
+            patch.object(adapter, "_new_web_client", return_value=client),
+            patch.dict(os.environ, {"SLACK_WORKSPACE_TEAM_IDS": "T_ONE,T_TWO"}, clear=False),
+        ):
+            await adapter._authenticate_workspace("xoxb-fake", None)
+
+        assert set(adapter._team_clients) == {"T_ONE", "T_TWO"}
+        assert adapter._team_clients["T_ONE"] is client
+        assert adapter._team_bot_user_ids["T_TWO"] == "U_BOT"
+
+
 class TestSlackConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
 
@@ -500,7 +527,7 @@ class TestSlackConnectCleanup:
         adapter = SlackAdapter(config)
 
         # Simulate state left over from a prior connect() call.
-        first_handler = AsyncMock()
+        first_handler = MagicMock(spec=["close_async"])
         first_handler.close_async = AsyncMock()
         adapter._handler = first_handler
 
@@ -711,6 +738,33 @@ class TestSlackSocketWatchdog:
                 await asyncio.sleep(0.01)
 
             assert len(instances) == 1, "watchdog kept reconnecting after disconnect"
+
+
+    @pytest.mark.asyncio
+    async def test_connect_stays_degraded_until_transport_is_confirmed(self):
+        class FakeHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.app = app
+                self.app_token = app_token
+                self.proxy = proxy
+                self.client = SimpleNamespace(is_connected=lambda: False)
+
+            async def start_async(self):
+                return None
+
+            async def close_async(self):
+                return None
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(FakeHandler):
+                stack.enter_context(p)
+            try:
+                assert await adapter.connect() is True
+                assert adapter._running is True
+                assert adapter.send_path_degraded is True
+            finally:
+                await adapter.disconnect()
 
 
     @pytest.mark.asyncio

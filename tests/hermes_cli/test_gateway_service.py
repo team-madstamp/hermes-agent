@@ -529,6 +529,8 @@ class TestLaunchdServiceRecovery:
         assert cmd[bash_idx + 1] == "-c"
         script = cmd[bash_idx + 2]
         assert "bootout" in script and "bootstrap" in script
+        assert "launchctl print gui/501/ai.hermes.gateway" in script
+        assert "launchctl list" not in script
         assert str(plist_path) in script
         # The one-shot job must deregister its own transient label at the end,
         # otherwise every reload leaks a dead label in launchd.
@@ -2583,7 +2585,7 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
     """`_retry_launchctl_bootstrap_until_registered` — salvage of #53277.
 
     Covers the three review findings the salvage hardens: retry until the
-    label is actually LISTED (not just a zero bootstrap exit), TimeoutExpired
+    label has a live PID in its explicit launchd domain (not just a zero bootstrap exit), TimeoutExpired
     is retried (not escaped leaving the service unloaded), and the retry is
     bounded by a wall-clock deadline rather than a fixed short window.
     """
@@ -2592,22 +2594,19 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
     PLIST = "/tmp/ai.hermes.gateway.plist"
     LABEL = "ai.hermes.gateway"
 
-    # `launchctl list <label>` output for a job launchd is actively running.
-    # Success requires a PID here, not just exit 0 — exit 0 alone also covers a
-    # registered-but-not-running definition (macOS 26+ `state = not running`).
-    RUNNING_LIST_OUTPUT = '{\n\t"PID" = 4242;\n\t"Label" = "ai.hermes.gateway";\n};'
+    RUNNING_PRINT_OUTPUT = "ai.hermes.gateway = {\n\tstate = running\n\tpid = 4242\n};"
 
     def test_returns_true_once_label_is_registered(self, monkeypatch):
         """Success requires launchctl list to confirm a supervised process, not
         just a zero bootstrap exit."""
-        list_results = iter([1, 0])  # first check: not registered, second: registered
+        print_results = iter([1, 0])
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd[:2] == ["launchctl", "list"]:
-                rc = next(list_results)
+            if cmd[:2] == ["launchctl", "print"]:
+                rc = next(print_results)
                 return SimpleNamespace(
                     returncode=rc,
-                    stdout=self.RUNNING_LIST_OUTPUT if rc == 0 else "",
+                    stdout=self.RUNNING_PRINT_OUTPUT if rc == 0 else "",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2632,12 +2631,11 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
                 if attempts["bootstrap"] == 1:
                     raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 30))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
-            if cmd[:2] == ["launchctl", "list"]:
-                # registered only after the second (successful) bootstrap
+            if cmd[:2] == ["launchctl", "print"]:
                 ok = attempts["bootstrap"] >= 2
                 return SimpleNamespace(
                     returncode=0 if ok else 1,
-                    stdout=self.RUNNING_LIST_OUTPUT if ok else "",
+                    stdout=self.RUNNING_PRINT_OUTPUT if ok else "",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2659,15 +2657,14 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         gateway launchd is not actually running. Verified against live launchd
         on 2026-08-05.
         """
-        list_calls = {"n": 0}
+        print_calls = {"n": 0}
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd[:2] == ["launchctl", "list"]:
-                list_calls["n"] += 1
-                # Registered (exit 0) but no PID line — never running.
+            if cmd[:2] == ["launchctl", "print"]:
+                print_calls["n"] += 1
                 return SimpleNamespace(
                     returncode=0,
-                    stdout='{\n\t"Label" = "ai.hermes.gateway";\n};',
+                    stdout="ai.hermes.gateway = {\n\tstate = not running\n};",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2680,7 +2677,7 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
             deadline=gateway_cli.time.monotonic() - 1,  # already expired
         )
         assert ok is False
-        assert list_calls["n"] >= 1
+        assert print_calls["n"] >= 1
 
 
 class TestTimeoutStopSecCoversCronFloor:
