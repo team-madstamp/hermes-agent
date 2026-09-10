@@ -33,6 +33,21 @@ class SessionMigrationMixin:
             logger.warning("No Honcho session cached for '%s', skipping memory migration", session_key)
             return False
 
+        # Once per (workspace, user peer): without this marker every NEW session (per-directory,
+        # per-chat gateway key, ...) re-uploaded the same files, and Honcho derived the same
+        # conclusions again each time (2026-09-10 audit: 24 of 33 sessions carried the upload,
+        # 302 exact-duplicate conclusions). Delete the marker to force a re-upload.
+        marker_path = memory_path / ".honcho-migrated.json"
+        marker_key = f"{getattr(self.honcho, 'workspace_id', '')}:{session.user_peer_id}"
+        try:
+            import json as _json
+            marker = _json.loads(marker_path.read_text(encoding="utf-8")) if marker_path.exists() else {}
+        except Exception:
+            marker = {}
+        if isinstance(marker, dict) and marker_key in marker:
+            logger.info("Skipping memory-file migration: already uploaded for %s (marker %s)", marker_key, marker_path)
+            return False
+
         # Owner-scoped: these files describe the install owner; uploading them under another
         # human's peer would make Honcho attribute the owner's facts to that person. The owner is
         # the CONFIG peerName — never a re-resolution of the session's own peer (that would compare
@@ -75,4 +90,12 @@ class SessionMigrationMixin:
             except Exception as e:
                 logger.error("Failed to upload %s to Honcho: %s", filename, e)
 
+        if uploaded:
+            try:
+                import json as _json
+                from datetime import datetime as _dt
+                marker[marker_key] = {"session": session.honcho_session_id, "uploaded_at": _dt.now().isoformat(timespec="seconds")}
+                marker_path.write_text(_json.dumps(marker, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+            except Exception as e:  # marker is best-effort; a failed write only costs one more upload later
+                logger.warning("Could not write memory-migration marker %s: %s", marker_path, e)
         return uploaded
