@@ -286,6 +286,16 @@ def test_telegram_final_response_sanitizes_raw_provider_errors():
     assert "req_abc" not in sanitized
 
 
+def test_telegram_final_response_sanitizes_model_unavailable():
+    raw = "HTTP 400: Error from provider (Console): Upstream request failed: Model is unavailable."
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+
+    assert "selected model is unavailable" in sanitized.lower()
+    assert "configure a fallback" in sanitized.lower()
+    assert "HTTP 400" not in sanitized
+    assert "Upstream request failed" not in sanitized
+
+
 def test_telegram_final_response_redacts_auth_secrets():
     """Authentication errors should be useful without leaking key material."""
     raw = (

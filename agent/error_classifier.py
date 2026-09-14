@@ -226,7 +226,8 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 # model_not_found triggers fallback instead of burning retries (#58446).
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
-    "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
+    "no such model", "unknown model", "unsupported model", "model is unavailable", "model unavailable",
+    "no endpoints found that support tool use",
 )
 
 # Qwen/vLLM chat-template "No user query found". Shared by the invalid-body

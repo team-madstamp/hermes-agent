@@ -61,6 +61,7 @@ def test_closed_vocabulary_contains_every_code():
         ("model 'gpt-9' not found", fr.MODEL_UNAVAILABLE),
         ("The model `foo-bar` does not exist", fr.MODEL_UNAVAILABLE),
         ("model_not_found", fr.MODEL_UNAVAILABLE),
+        ("HTTP 400: Error from provider (Console): Upstream request failed: Model is unavailable.", fr.MODEL_UNAVAILABLE),
         ("status: 401 unauthorized", fr.PROVIDER_AUTH_OR_ACCESS),
         ("upstream server error", fr.PROVIDER_SERVER_ERROR),
         # bare numbers WITHOUT a status-code context must not classify —

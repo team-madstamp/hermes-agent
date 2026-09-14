@@ -75,7 +75,7 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (rf"{_STATUS}5\d{{2}}\b|server error|overloaded", PROVIDER_SERVER_ERROR),
         (r"context length|context_overflow|maximum context", CONTEXT_OVERFLOW),
         (r"no llm provider configured|missing config|no access token", MISSING_CONFIG),
-        (r"model .*(not found|does not exist)|model_not_found", MODEL_UNAVAILABLE),
+        (r"model\b.*(?:not found|does not exist|(?:is\s+)?unavailable)|model_not_found", MODEL_UNAVAILABLE),
     )
 )
 

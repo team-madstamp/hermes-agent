@@ -61,3 +61,10 @@ class TestGatewayConnectionErrorReply:
         assert "rate-limiting" in _gateway_provider_error_reply(
             "rate limited after 3 retries"
         ).lower()
+
+    def test_model_unavailable_gets_actionable_reply(self):
+        text = "HTTP 400: Error from provider (Console): Upstream request failed: Model is unavailable."
+        assert _looks_like_gateway_provider_error(text)
+        reply = _gateway_provider_error_reply(text)
+        assert "selected model is unavailable" in reply.lower()
+        assert "configure a fallback" in reply.lower()

@@ -485,6 +485,20 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
+    @pytest.mark.parametrize("status_code", [400, None])
+    def test_console_model_unavailable_is_fallback_worthy_model_failure(self, status_code):
+        e = MockAPIError(
+            "Error from provider (Console): Upstream request failed: Model is unavailable.",
+            status_code=status_code,
+        )
+        result = classify_api_error(
+            e, provider="opencode-free", model="deepseek-v4-flash-free"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
     def test_message_only_overloaded_without_status_is_overloaded(self):
         """Some Anthropic-compatible proxies surface 'overloaded' in the
         message with no 503/529 status_code. It must classify as overloaded

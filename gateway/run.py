@@ -381,6 +381,10 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
     r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key|\b401\b)",
     re.IGNORECASE)
 
+_GATEWAY_MODEL_UNAVAILABLE_RE = re.compile(
+    r"\bmodel(?:\s+is)?\s+(?:unavailable|not\s+available|not\s+found)\b|model[_\s]+not[_\s]+found",
+    re.IGNORECASE)
+
 _GATEWAY_RATE_LIMIT_RE = re.compile(
     r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)", re.IGNORECASE)
 
@@ -604,6 +608,8 @@ def _format_exec_approval_fallback(
 _PROVIDER_ERROR_REPLIES = (
     (_GATEWAY_AUTH_ERROR_RE, "⚠️ Provider authentication failed. Check the configured credentials; "
                              "raw provider details are in the gateway logs."),
+    (_GATEWAY_MODEL_UNAVAILABLE_RE, "⚠️ The selected model is unavailable on this provider route. "
+                                    "Choose another model or configure a fallback."),
     (_GATEWAY_PROVIDER_POLICY_RE, "⚠️ The model provider rejected the request. I kept the raw provider "
                                   "error out of chat; check gateway logs for details or try rephrasing."),
     (_GATEWAY_RATE_LIMIT_RE, "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."),
