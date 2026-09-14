@@ -74,7 +74,7 @@ from hermes_cli.update_cmd_config import (  # noqa: F401
 from hermes_cli.update_cmd_deps import (  # noqa: F401
     _INSTALL_DEFINING_FILES, _SELF_LOCKING_NATIVE_MODULES, _UPDATE_CRITICAL_MODULES,
     _abort_dependency_sync_if_self_locked, _capture_active_lazy_features,
-    _capture_active_tool_dependencies, _critical_module_import_failures,
+    _capture_active_tool_dependencies, _capture_installed_platform_extras, _critical_module_import_failures,
     _defer_update_for_self_lock, _dependency_sync_would_rewrite, _desktop_app_present,
     _detect_self_loaded_native_modules, _editable_install_is_current, _ensure_uv_for_termux,
     _ensure_venv_pip, _install_psutil_android_compat, _is_android_python, _npm_bin_exists,
@@ -82,7 +82,7 @@ from hermes_cli.update_cmd_deps import (  # noqa: F401
     _rebuild_desktop_after_update, _record_npm_lockfile_hash, _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies, _refuse_update_if_venv_foreign_owned,
     _repair_node_deps_on_current_checkout, _restore_active_tool_dependencies,
-    _sync_python_dependencies_after_pull, _update_node_dependencies,
+    _restore_installed_platform_extras, _sync_python_dependencies_after_pull, _update_node_dependencies,
     _upgrade_pip_before_lazy_refresh, _validate_critical_modules_import,
     _venv_core_imports_healthy, _venv_foreign_owned_paths, _web_build_toolchain_ready,
     _web_toolchain_roots)
@@ -959,6 +959,7 @@ class _UpdateOptions:
 
     active_lazy_features: object
     active_tool_dependencies: object
+    active_platform_extras: object
     pre_update_version: object
     gw_input_fn: object
     assume_yes: bool
@@ -973,6 +974,7 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
     # environment can still prove which optional backends were active.
     active_lazy_features = _m()._capture_active_lazy_features()
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
+    active_platform_extras = _m()._capture_installed_platform_extras()
 
     # Captured before any pull so the completion line can report the transition.
     # Snapshot the pre-update version before files are replaced so the completion line can report the
@@ -1001,7 +1003,8 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
             discard_local_changes = _mode == "discard"
     return _UpdateOptions(
         active_lazy_features=active_lazy_features,
-        active_tool_dependencies=active_tool_dependencies, pre_update_version=pre_update_version,
+        active_tool_dependencies=active_tool_dependencies, active_platform_extras=active_platform_extras,
+        pre_update_version=pre_update_version,
         gw_input_fn=gw_input_fn, assume_yes=assume_yes, keep_stash=keep_stash,
         switch_branch=switch_branch, discard_local_changes=discard_local_changes)
 
@@ -1242,6 +1245,7 @@ def _apply_pulled_update(
     _sync_python_dependencies_after_pull(
         git_cmd, branch, pre_pull_sha, active_lazy_features=opts.active_lazy_features,
         active_tool_dependencies=opts.active_tool_dependencies,
+        active_platform_extras=opts.active_platform_extras,
         _windows_gateway_resume=_windows_gateway_resume)
 
     node_failures = _update_node_dependencies()

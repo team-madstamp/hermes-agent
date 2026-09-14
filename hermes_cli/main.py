@@ -2055,6 +2055,7 @@ _FROZEN_UPDATER_SURFACE: dict[str, tuple[str, ...]] = {
     "hermes_cli.update_cmd": (
         "_abort_dependency_sync_if_self_locked", "_assess_parked_branch_switch",
         "_capture_active_lazy_features", "_capture_active_tool_dependencies",
+        "_capture_installed_platform_extras",
         "_cold_start_windows_gateway_after_update", "_defer_update_for_self_lock",
         "_dependency_sync_would_rewrite", "_detect_self_loaded_native_modules",
         "_detect_venv_python_processes", "_discard_stashed_changes",
@@ -2067,7 +2068,8 @@ _FROZEN_UPDATER_SURFACE: dict[str, tuple[str, ...]] = {
         "_refresh_active_lazy_features", "_refresh_active_memory_provider_dependencies",
         "_refresh_bootstrap_cache_scripts", "_refresh_windows_gateway_launchers",
         "_relaunch_stopped_serves", "_reload_updated_runtime_modules",
-        "_restore_active_tool_dependencies", "_restore_stashed_changes",
+        "_restore_active_tool_dependencies", "_restore_installed_platform_extras",
+        "_restore_stashed_changes",
         "_resume_windows_gateways_after_update", "_run_logged_subprocess", "_run_pre_update_backup",
         "_stash_local_changes_if_needed", "_stop_process_trees", "_sync_with_upstream_if_needed",
         "_upgrade_pip_before_lazy_refresh", "_venv_launcher_ancestors",

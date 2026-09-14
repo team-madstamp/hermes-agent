@@ -316,7 +316,7 @@ def _download_and_swap_zip(branch: str, zip_url: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _reinstall_python_deps_after_zip(active_tool_dependencies) -> None:
+def _reinstall_python_deps_after_zip(active_tool_dependencies, active_platform_extras=None) -> None:
     """Reinstall Python deps (uv preferred, pip fallback) and re-arm active tool deps."""
     from hermes_cli.update_cmd import (
         _ensure_uv_for_termux, _ensure_venv_pip, _m, _refuse_update_for_contended_shims, _shim_quarantine_error_type,
@@ -351,6 +351,7 @@ def _reinstall_python_deps_after_zip(active_tool_dependencies) -> None:
         _m()._install_python_dependencies_with_optional_fallback(pip_cmd)
         install_prefix, install_env = pip_cmd, None
     _m()._restore_active_tool_dependencies(active_tool_dependencies, install_prefix, env=install_env)
+    _m()._restore_installed_platform_extras(active_platform_extras or [], install_prefix, env=install_env)
     # Parity with git-pull path: heal the active memory provider's bridge packages after the reinstall.
     _m()._refresh_active_memory_provider_dependencies()
 
@@ -365,6 +366,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         _verify_and_restore_state_dbs_post_update,
     )
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
+    active_platform_extras = _m()._capture_installed_platform_extras()
     pre_update_version = _read_project_version()  # snapshot before files are replaced, for the completion line
     # The static archive would silently ignore --branch — the exact silent-divergence bug it exists to
     # prevent. Refuse rather than lie.
@@ -388,7 +390,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # capabilities. See #86735.
     _m()._abort_dependency_sync_if_self_locked()
     print("→ Updating Python dependencies...")
-    _reinstall_python_deps_after_zip(active_tool_dependencies)
+    _reinstall_python_deps_after_zip(active_tool_dependencies, active_platform_extras)
     # Verify the tree imports (catches the parse-OK-but-skewed tree an interrupted copy leaves). Runs
     # *after* the dep reinstall so a genuinely-new third-party requirement isn't misreported as a partial
     # copy. No SHA to roll back to — surface a concrete recovery step instead of success over a bricked install.

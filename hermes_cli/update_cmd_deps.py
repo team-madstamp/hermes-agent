@@ -191,6 +191,92 @@ def _capture_active_tool_dependencies() -> list[str]:
         return []
 
 
+# Messaging-platform extras ``hermes setup`` installs. They live outside LAZY_DEPS (so the lazy
+# refresh never touches them), outside ``hermes tools`` restores, and outside the memory-provider
+# bridge refresh — nothing remembered them across a core reinstall. Observed 2026-09-14: after a
+# venv-affecting update the gateway came up with telegram/slack adapters dead and cron delivery
+# failing, because ``security.allow_lazy_installs=false`` (correctly) blocked the only auto-heal
+# slack had, and telegram had none at all.
+_PLATFORM_EXTRAS_MARKER_MODULES = {
+    "messaging": "telegram",
+    "slack": "slack_bolt",
+    "matrix": "mautrix",
+    "wecom": "defusedxml",
+}
+
+
+def _platform_extras_requirements(extra: str) -> list[str]:
+    """Pinned requirement strings for ``extra`` from ``pyproject.toml``, read at runtime so pin
+    bumps need no edit here. Empty when the extra vanished from the manifest (nothing to install)."""
+    try:
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - pre-3.11 interpreters
+            import tomli as tomllib
+        from hermes_cli.update_cmd import _m
+        manifest = tomllib.loads((_m().PROJECT_ROOT / "pyproject.toml").read_text())
+        return list(manifest.get("project", {}).get("optional-dependencies", {}).get(extra, []))
+    except Exception as exc:
+        logger.debug("Could not read pyproject extras for %r: %s", extra, exc)
+        return []
+
+
+def _capture_installed_platform_extras() -> list[str]:
+    """Snapshot messaging-platform extras already importable in this venv (the ``hermes`` CLI
+    runs on the venv being updated), so a core reinstall that strips them restores exactly what
+    ``hermes setup`` had put there. Indeterminate probes read as absent: under-capturing only
+    skips a restore; it never installs something new."""
+    installed: list[str] = []
+    for extra, marker in _PLATFORM_EXTRAS_MARKER_MODULES.items():
+        if _module_importable_in(sys.executable, marker, None):
+            installed.append(extra)
+    return installed
+
+
+def _restore_installed_platform_extras(
+    extras: list[str], install_cmd_prefix: list[str], *, env: dict[str, str] | None = None
+) -> None:
+    """Reinstall messaging-platform extras the core reinstall stripped, with their pinned specs.
+
+    Deliberately independent of ``security.allow_lazy_installs``: that flag governs NEW lazy
+    installs at runtime; re-installing what the user already chose via ``hermes setup`` is a
+    restore, not a new install. Never raises — a failed optional platform must not block the
+    update, but must be reported (mirrors ``_restore_active_tool_dependencies``)."""
+    from hermes_cli.update_cmd import _m
+    if not extras:
+        return
+
+    target_python = _m()._resolve_install_target_python(install_cmd_prefix, env)
+    missing: list[tuple[str, list[str]]] = []
+    for extra in extras:
+        marker = _PLATFORM_EXTRAS_MARKER_MODULES.get(extra)
+        requirements = _platform_extras_requirements(extra)
+        if not marker or not requirements:
+            continue
+        if target_python is not None and _module_importable_in(target_python, marker, env):
+            continue
+        missing.append((extra, requirements))
+    if not missing:
+        return
+
+    print()
+    print(f"→ Restoring {len(missing)} messaging-platform extra set(s)...")
+    restored: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for extra, requirements in missing:
+        try:
+            _m()._run_package_only_install(
+                install_cmd_prefix + ["install", *requirements, "--quiet"], env=env)
+            restored.append(extra)
+        except Exception as exc:
+            failed.append((extra, str(exc)))
+
+    if restored:
+        print(f"  ✓ {len(restored)} restored: {', '.join(restored)}")
+    for extra, reason in failed:
+        print(f"  ⚠ {extra} failed to restore: {_clip(reason)}")
+
+
 def _module_importable_in(target_python, module_name: str, env) -> bool:
     """Probe ``find_spec(module_name)`` under *target_python*; an indeterminate probe reads as
     missing (safer to repair than to assume it survived)."""
@@ -960,10 +1046,10 @@ def _refuse_update_if_venv_foreign_owned(project_root) -> None:
 
 def _sync_python_dependencies_after_pull(
     git_cmd, branch, pre_pull_sha, *, active_lazy_features, active_tool_dependencies,
-    _windows_gateway_resume):
+    active_platform_extras=None, _windows_gateway_resume):
     """Reinstall Python deps for the pulled checkout. Order matters: ownership preflight ->
     self-lock deferral -> core marker -> ``.[all]`` -> bytecode sweep -> lazy/tool refresh (own
-    marker) -> memory-provider deps -> critical-import probe (warn only; stale bytecode self-heals)."""
+    marker) -> platform-extras restore -> memory-provider deps -> critical-import probe (warn only; stale bytecode self-heals)."""
     from hermes_cli.update_cmd import (
         _m, _pip_install_prefix, _sweep_bytecode_after_update, _validate_critical_modules_import,
         _write_lazy_refresh_incomplete_marker, _write_update_incomplete_marker)
@@ -1037,6 +1123,10 @@ def _sync_python_dependencies_after_pull(
             "to finish import-based venv repair.")
 
     _m()._restore_active_tool_dependencies(active_tool_dependencies, install_prefix, env=lazy_env)
+
+    # Messaging-platform extras installed by `hermes setup`: nothing else restores them, and
+    # allow_lazy_installs=false blocks slack's only auto-heal (2026-09-14 adapter outage).
+    _m()._restore_installed_platform_extras(active_platform_extras, install_prefix, env=lazy_env)
 
     # Heal memory-provider bridge packages last — the steps above may have stripped them.
     _m()._refresh_active_memory_provider_dependencies()
