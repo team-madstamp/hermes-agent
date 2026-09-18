@@ -67,7 +67,7 @@ concurrency:
 jobs:
   check:
     name: uv lock --check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pin until tested on ubuntu-26.04; latest migrates 2026-10-19..11-19
     timeout-minutes: 5
     steps:
       - name: Checkout code
